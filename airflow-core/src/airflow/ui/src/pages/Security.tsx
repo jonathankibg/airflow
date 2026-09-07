@@ -16,12 +16,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { Box } from "@chakra-ui/react";
 import { useRef } from "react";
+
+import { Box } from "@chakra-ui/react";
+import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { useAuthLinksServiceGetAuthMenus } from "openapi/queries";
-import { ProgressBar } from "src/components/ui";
+
+import { ProgressBar } from "src/system-components";
+
+import { useDocumentTitle } from "src/utils";
 
 import { ErrorPage } from "./Error";
 
@@ -33,6 +38,9 @@ const SANDBOX = "allow-scripts allow-same-origin allow-forms";
 
 export const Security = () => {
   const { page } = useParams();
+  const { t: translate } = useTranslation();
+
+  useDocumentTitle(translate("nav.security"));
 
   const { data: authLinks, isLoading } = useAuthLinksServiceGetAuthMenus();
 

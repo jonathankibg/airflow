@@ -97,10 +97,8 @@ class TestProjectStructure:
             "providers/cncf/kubernetes/tests/unit/cncf/kubernetes/triggers/test_kubernetes_pod.py",
             "providers/cncf/kubernetes/tests/unit/cncf/kubernetes/utils/test_delete_from.py",
             "providers/cncf/kubernetes/tests/unit/cncf/kubernetes/utils/test_k8s_hashlib_wrapper.py",
-            "providers/cncf/kubernetes/tests/unit/cncf/kubernetes/utils/test_xcom_sidecar.py",
             "providers/common/sql/tests/unit/common/sql/datafusion/test_base.py",
             "providers/common/sql/tests/unit/common/sql/datafusion/test_exceptions.py",
-            "providers/common/ai/tests/unit/common/ai/test_exceptions.py",
             "providers/common/compat/tests/unit/common/compat/lineage/test_entities.py",
             "providers/common/compat/tests/unit/common/compat/standard/test_operators.py",
             "providers/common/compat/tests/unit/common/compat/standard/test_triggers.py",
@@ -111,8 +109,6 @@ class TestProjectStructure:
             "providers/edge3/tests/unit/edge3/models/test_edge_job.py",
             "providers/edge3/tests/unit/edge3/models/test_edge_logs.py",
             "providers/edge3/tests/unit/edge3/models/test_edge_worker.py",
-            "providers/edge3/tests/unit/edge3/worker_api/test_app.py",
-            "providers/edge3/tests/unit/edge3/worker_api/test_auth.py",
             "providers/edge3/tests/unit/edge3/worker_api/test_datamodels.py",
             "providers/edge3/tests/unit/edge3/worker_api/test_datamodels_ui.py",
             "providers/fab/tests/unit/fab/auth_manager/api_fastapi/datamodels/test_login.py",
@@ -172,8 +168,6 @@ class TestProjectStructure:
             "providers/google/tests/unit/google/cloud/utils/test_bigquery_get_data.py",
             "providers/google/tests/unit/google/common/hooks/test_operation_helpers.py",
             "providers/google/tests/unit/google/test_go_module_utils.py",
-            "providers/http/tests/unit/http/test_exceptions.py",
-            "providers/keycloak/tests/unit/keycloak/auth_manager/datamodels/test_token.py",
             "providers/microsoft/azure/tests/unit/microsoft/azure/operators/test_adls.py",
             "providers/snowflake/tests/unit/snowflake/triggers/test_snowflake_trigger.py",
             "providers/standard/tests/unit/standard/operators/test_branch.py",
@@ -535,6 +529,7 @@ class TestAmazonProviderProjectStructure(ExampleCoverageTest):
 
     BASE_CLASSES = {
         "airflow.providers.amazon.aws.operators.base_aws.AwsBaseOperator",
+        "airflow.providers.amazon.aws.operators.glue_crawler._GlueCrawlerBaseOperator",
         "airflow.providers.amazon.aws.operators.rds.RdsBaseOperator",
         "airflow.providers.amazon.aws.operators.sagemaker.SageMakerBaseOperator",
         "airflow.providers.amazon.aws.sensors.base_aws.AwsBaseSensor",
@@ -564,6 +559,7 @@ class TestAmazonProviderProjectStructure(ExampleCoverageTest):
     }
 
     DEPRECATED_CLASSES = {
+        "airflow.providers.amazon.aws.operators.glue_crawler.GlueCrawlerOperator",
         "airflow.providers.amazon.aws.operators.lambda_function.AwsLambdaInvokeFunctionOperator",
     }
 
