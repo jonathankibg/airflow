@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import textwrap
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -43,12 +43,10 @@ from airflow_shared.logging.structlog import (
 # We avoid the caplog fixture for most tests here; the main purpose of this file is to capture the
 # _rendered_ output of the tests to make sure it is correct.
 
-PY_3_11 = sys.version_info >= (3, 11)
-
 
 @pytest.fixture(autouse=True)
 def set_time(time_machine):
-    time_machine.move_to(datetime(1985, 10, 26, microsecond=1, tzinfo=timezone.utc), tick=False)
+    time_machine.move_to(datetime(1985, 10, 26, microsecond=1, tzinfo=UTC), tick=False)
 
 
 @pytest.fixture
@@ -368,8 +366,7 @@ def test_precent_fmt_exc(structlog_config, get_logger, monkeypatch):
           File "{__file__}", line {lineno}, in test_precent_fmt_exc
             1 / 0
     """)
-    if PY_3_11:
-        expected += "    ~~^~~\n"
+    expected += "    ~~^~~\n"
     expected += "ZeroDivisionError: division by zero\n"
     assert written == expected
 
@@ -462,6 +459,19 @@ def test_logger_respects_configured_level(structlog_config):
 
     written = sio.getvalue()
     assert "[my_logger] Debug message\n" in written
+
+
+def test_alembic_runtime_plugin_setup_logs_are_suppressed(structlog_config):
+    with structlog_config(
+        colors=False,
+        log_format="[%(name)s] %(message)s",
+        log_level="INFO",
+    ) as sio:
+        logger = logging.getLogger("alembic.runtime.plugins")
+        logger.info("Filtered plugin setup message")
+        logger.warning("Visible warning")
+
+    assert sio.getvalue() == "[alembic.runtime.plugins] Visible warning\n"
 
 
 def test_excepthook_installed_when_json_output_true(structlog_config):

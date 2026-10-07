@@ -19,36 +19,107 @@
 ``apache-airflow-providers-common-ai``
 ##################################################
 
+Run model calls and tool-using agents as Airflow tasks. A task can classify, extract,
+summarize or route with any model vendor, or hand a model a set of tools built from your
+Airflow connections and let it work. Airflow supplies what a script does not: the API key
+comes from a connection, a failed call retries, a run can pause for a person to approve the
+output, the result lands in XCom for the next task, and the whole thing runs on a schedule.
+
+Start here
+----------
+
+- :doc:`quickstart`: install, connect a vendor, run a two-task Dag and check its output.
+- :doc:`use_cases/index`: ten jobs a data team already has, each with the Dag that does it.
+- :doc:`model_providers`: which vendors work, and the extra, connection and prefix for each.
+
+This is the Dag the quick start runs. The ``summarize`` task sends the release notes to the
+model on the ``pydanticai_default`` connection; ``publish`` receives the answer like any
+other upstream result:
+
+.. exampleinclude:: /../../ai/src/airflow/providers/common/ai/example_dags/example_quickstart.py
+    :language: python
+    :start-after: [START howto_quickstart_llm]
+    :end-before: [END howto_quickstart_llm]
+
+Point ``pydanticai_default`` at OpenAI, Anthropic, Google, Bedrock or a self-hosted server
+and the Dag does not change. :doc:`concepts` explains the ideas behind the provider in one
+page.
+
+When to use this provider
+-------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 30 30
+
+   * - Use case
+     - Use
+     - Package
+   * - Portable generation, classification, extraction, branching, or a
+       worker-run agent with toolsets
+     - ``common.ai``
+     - ``apache-airflow-providers-common-ai``
+   * - Many prompts through a batch API at half the price, with retry-safe re-attachment
+       and results landed on object storage
+     - ``common.ai``
+     - ``apache-airflow-providers-common-ai`` (:doc:`operators/llm_batch`)
+   * - A vendor's native Embeddings or Responses API, or a batch of raw provider request
+       bodies (multi-turn, images, non-chat endpoints)
+     - The vendor's own provider
+     - e.g. :doc:`apache-airflow-providers-openai:index`,
+       :doc:`apache-airflow-providers-anthropic:index`,
+       :doc:`apache-airflow-providers-cohere:index`
+   * - A vendor-managed, server-side agent session (e.g. Anthropic Managed Agents)
+     - The vendor's own provider
+     - e.g. :doc:`apache-airflow-providers-anthropic:index`
+
+As a rule of thumb: if Airflow should *run* the AI step (and the model should stay
+swappable), use ``common.ai``; if the Dag *submits work to* a vendor-managed service and
+waits for the result, use that vendor's provider.
 
 .. toctree::
+    :titlesonly:
     :hidden:
-    :maxdepth: 1
     :caption: Basics
 
     Home <self>
     Changelog <changelog>
     Security <security>
+    Securing agent tools <agent_security>
 
 .. toctree::
+    :titlesonly:
     :hidden:
-    :maxdepth: 1
+    :caption: Getting started
+
+    Installation <installation>
+    Quick start <quickstart>
+    Core concepts <concepts>
+    Develop and test locally <local_development>
+
+.. toctree::
+    :titlesonly:
+    :hidden:
     :caption: Guides
 
-    Connection types <connections/pydantic_ai>
-    MCP connection <connections/mcp>
-    Hooks <hooks/index>
-    Toolsets <toolsets>
-    Operators <operators/index>
-    Retry Policies <retry_policies>
-    HITL Review <hitl_review>
-    Observability <observability>
+    What you can build <use_cases/index>
+    Connections <connections/index>
+    Models and providers <model_providers>
+    Operators and decorators <operators/index>
+    Toolsets <toolsets/index>
+    Agent frameworks <frameworks/index>
+    LLM and agent features <features>
+    Document and RAG pipelines <rag_pipelines>
+    Reliability and operations <operations>
 
 .. toctree::
+    :titlesonly:
     :hidden:
-    :maxdepth: 1
     :caption: References
 
+    Example Dags <examples>
     Configuration <configurations-ref>
+    Stable and experimental features <stability>
     Python API <_api/airflow/providers/common/ai/index>
 
 .. toctree::
@@ -83,7 +154,7 @@ apache-airflow-providers-common-ai package
 AI/LLM hooks and operators for Airflow pipelines using `pydantic-ai <https://ai.pydantic.dev/>`__.
 
 
-Release: 0.6.0
+Release: 0.10.0
 
 Provider package
 ----------------
@@ -101,15 +172,16 @@ For the minimum Airflow version supported, see ``Requirements`` below.
 Requirements
 ------------
 
-The minimum Apache Airflow version supported by this provider distribution is ``3.0.0``.
+The minimum Apache Airflow version supported by this provider distribution is ``2.11.0``.
 
 ==========================================  ==================
 PIP package                                 Version required
 ==========================================  ==================
-``apache-airflow``                          ``>=3.0.0``
+``apache-airflow``                          ``>=2.11.0``
 ``apache-airflow-providers-common-compat``  ``>=1.15.0``
-``apache-airflow-providers-standard``       ``>=1.12.1``
-``pydantic-ai-slim``                        ``>=2.0.0``
+``apache-airflow-providers-standard``       ``>=1.20.0``
+``pydantic-ai-slim``                        ``>=2.33.0``
+``structlog``                               ``>=24.2.0``
 ==========================================  ==================
 
 Optional cross provider package dependencies
@@ -130,6 +202,7 @@ Dependent package                                                               
 ============================================================================================================  ==============
 `apache-airflow-providers-common-sql <https://airflow.apache.org/docs/apache-airflow-providers-common-sql>`_  ``common.sql``
 `apache-airflow-providers-git <https://airflow.apache.org/docs/apache-airflow-providers-git>`_                ``git``
+`apache-airflow-providers-modal <https://airflow.apache.org/docs/apache-airflow-providers-modal>`_            ``modal``
 ============================================================================================================  ==============
 
 Optional dependencies
@@ -143,26 +216,30 @@ Install them when installing from PyPI. For example:
     pip install apache-airflow-providers-common-ai[anthropic]
 
 
-==============  ==========================================================================================================
-Extra           Dependencies
-==============  ==========================================================================================================
-``anthropic``   ``pydantic-ai-slim[anthropic]``
-``bedrock``     ``pydantic-ai-slim[bedrock]``
-``google``      ``pydantic-ai-slim[google]``
-``openai``      ``pydantic-ai-slim[openai]``
-``mcp``         ``pydantic-ai-slim[mcp]``
-``code-mode``   ``pydantic-ai-harness[codemode]>=0.3.0``
-``skills``      ``apache-airflow-providers-git>=0.4.0``, ``pydantic-ai-skills>=0.11.0``
-``avro``        ``fastavro>=1.10.0; python_version < "3.14"``, ``fastavro>=1.12.1; python_version >= "3.14"``
-``parquet``     ``pyarrow>=18.0.0; python_version < '3.14'``, ``pyarrow>=22.0.0; python_version >= '3.14'``
-``sql``         ``apache-airflow-providers-common-sql``, ``sqlglot>=30.0.0``
-``common.sql``  ``apache-airflow-providers-common-sql``
-``langchain``   ``langchain>=1.0.0``
-``llamaindex``  ``llama-index-core>=0.13.0``, ``llama-index-embeddings-openai>=0.6.0``, ``llama-index-llms-openai>=0.6.0``
-``pdf``         ``pypdf>=4.0.0``
-``docx``        ``python-docx>=1.0.0``
-``git``         ``apache-airflow-providers-git``
-==============  ==========================================================================================================
+===============  =======================================================================================================================================
+Extra            Dependencies
+===============  =======================================================================================================================================
+``anthropic``    ``pydantic-ai-slim[anthropic]>=2.33.0``, ``anthropic>=1.0.0``
+``bedrock``      ``pydantic-ai-slim[bedrock]>=2.33.0``
+``google``       ``pydantic-ai-slim[google]>=2.33.0``
+``openai``       ``pydantic-ai-slim[openai]>=2.33.0``, ``openai>=2.47.0``
+``typesafe``     ``typesafe-sdk>=0.6.0``
+``mcp``          ``pydantic-ai-slim[mcp]>=2.33.0``
+``modal``        ``apache-airflow-providers-modal``, ``modal>=1.5.2``
+``opensandbox``  ``opensandbox>=1.1.0``
+``code-mode``    ``pydantic-ai-harness[codemode]>=0.24.0``
+``shields``      ``pydantic-ai-shields>=0.3.4``
+``skills``       ``apache-airflow-providers-git>=0.4.0``, ``pydantic-ai-skills>=1.2.0``
+``avro``         ``fastavro>=1.10.0; python_version < "3.14"``, ``fastavro>=1.12.1; python_version >= "3.14"``
+``parquet``      ``pyarrow>=18.0.0; python_version < '3.14'``, ``pyarrow>=22.0.0; python_version >= '3.14'``
+``sql``          ``apache-airflow-providers-common-sql>=2.2.0``, ``sqlglot>=30.0.0``
+``common.sql``   ``apache-airflow-providers-common-sql>=2.2.0``
+``langchain``    ``langchain>=1.0.0``
+``llamaindex``   ``dataclasses-json>=0.6.7``, ``llama-index-core>=0.14.5``, ``llama-index-embeddings-openai>=0.6.0``, ``llama-index-llms-openai>=0.6.8``
+``pdf``          ``pypdf>=4.0.0``
+``docx``         ``python-docx>=1.0.0``
+``git``          ``apache-airflow-providers-git``
+===============  =======================================================================================================================================
 
 Downloading official packages
 -----------------------------
@@ -170,5 +247,5 @@ Downloading official packages
 You can download officially released packages and verify their checksums and signatures from the
 `Official Apache Download site <https://downloads.apache.org/airflow/providers/>`_
 
-* `The apache-airflow-providers-common-ai 0.6.0 sdist package <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.6.0.tar.gz>`_ (`asc <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.6.0.tar.gz.asc>`__, `sha512 <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.6.0.tar.gz.sha512>`__)
-* `The apache-airflow-providers-common-ai 0.6.0 wheel package <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.6.0-py3-none-any.whl>`_ (`asc <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.6.0-py3-none-any.whl.asc>`__, `sha512 <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.6.0-py3-none-any.whl.sha512>`__)
+* `The apache-airflow-providers-common-ai 0.10.0 sdist package <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.10.0.tar.gz>`_ (`asc <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.10.0.tar.gz.asc>`__, `sha512 <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.10.0.tar.gz.sha512>`__)
+* `The apache-airflow-providers-common-ai 0.10.0 wheel package <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.10.0-py3-none-any.whl>`_ (`asc <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.10.0-py3-none-any.whl.asc>`__, `sha512 <https://downloads.apache.org/airflow/providers/apache_airflow_providers_common_ai-0.10.0-py3-none-any.whl.sha512>`__)

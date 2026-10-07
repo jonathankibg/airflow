@@ -16,12 +16,14 @@
 # under the License.
 from __future__ import annotations
 
+import ast
 import difflib
 import itertools
 import json
 import os
 import re
 import sys
+import tomllib
 from collections import defaultdict
 from enum import Enum, auto
 from functools import cached_property
@@ -32,6 +34,8 @@ from airflow_breeze.branch_defaults import AIRFLOW_BRANCH, DEFAULT_AIRFLOW_CONST
 from airflow_breeze.global_constants import (
     ALL_PYTHON_MAJOR_MINOR_VERSIONS,
     APACHE_AIRFLOW_GITHUB_REPOSITORY,
+    CI_AMD_PLATFORM,
+    CI_ARM_PLATFORM,
     COMMITTERS,
     CURRENT_KUBERNETES_VERSIONS,
     CURRENT_MYSQL_VERSIONS,
@@ -51,7 +55,6 @@ from airflow_breeze.global_constants import (
     PROVIDERS_COMPATIBILITY_TESTS_MATRIX,
     PUBLIC_AMD_RUNNERS,
     PUBLIC_ARM_RUNNERS,
-    RUNNERS_TYPE_CROSS_MAPPING,
     TESTABLE_CORE_INTEGRATIONS,
     TESTABLE_PROVIDERS_INTEGRATION_OWNERS,
     TESTABLE_PROVIDERS_INTEGRATIONS,
@@ -92,6 +95,21 @@ UPGRADE_TO_NEWER_DEPENDENCIES_LABEL = "upgrade to newer dependencies"
 USE_PUBLIC_RUNNERS_LABEL = "use public runners"
 ALLOW_PROVIDER_DEPENDENCY_BUMP_LABEL = "allow provider dependency bump"
 SKIP_COMMON_COMPAT_CHECK_LABEL = "skip common compat check"
+AREA_E2E_TESTS_LABEL = "area:e2e-tests"
+AREA_KUBERNETES_TESTS_LABEL = "area:kubernetes-tests"
+
+# Providers split into their own test type, see _extract_long_provider_tests. Every other provider runs
+# in one shared ``Providers[-amazon,celery,google,standard]`` test type on canary builds.
+LONG_RUNNING_TEST_PROVIDERS = ["amazon", "celery", "google", "standard"]
+# Providers whose DB tests leave process-global core state behind (``importlib.reload()`` of
+# ``airflow.executors.executor_loader``, which swaps the ``ExecutorLoader`` class object and refills its
+# module-level caches). DB tests of one test type run in a single pytest process, with provider test
+# folders in sorted order, so every provider sorting after one of these inherits that state on canary.
+# A PR that changes such a later provider runs these providers in the same test type too, otherwise
+# isolation failures in the changed tests surface only after merge. Non-DB tests share one xdist pool
+# across all test types, so no deterministic order exists there to reproduce.
+PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS = ["cncf.kubernetes"]
+
 ALL_CI_SELECTIVE_TEST_TYPES = "API Always CLI Core Other Serialization"
 
 ALL_PROVIDERS_SELECTIVE_TEST_TYPES = (
@@ -114,12 +132,16 @@ class FileGroupForCi(Enum):
     DOC_FILES = auto()
     TEXT_NON_DOC_FILES = auto()
     UI_FILES = auto()
+    UI_OPENAPI_FILES = auto()
     SYSTEM_TEST_FILES = auto()
     KUBERNETES_FILES = auto()
     TASK_SDK_FILES = auto()
     TASK_SDK_INTEGRATION_TEST_FILES = auto()
+    AGENT_FRAMEWORK_FILES = auto()
     GO_SDK_FILES = auto()
     JAVA_SDK_FILES = auto()
+    TS_SDK_FILES = auto()
+    TS_SDK_DOCS_FILES = auto()
     AIRFLOW_CTL_FILES = auto()
     AIRFLOW_CTL_INTEGRATION_TEST_FILES = auto()
     BREEZE_INTEGRATION_TEST_FILES = auto()
@@ -130,6 +152,9 @@ class FileGroupForCi(Enum):
     EVENT_DRIVEN_E2E_FILES = auto()
     JAVA_SDK_E2E_FILES = auto()
     GO_SDK_E2E_FILES = auto()
+    OPENLINEAGE_E2E_FILES = auto()
+    OPENLINEAGE_E2E_COMPAT_FILES = auto()
+    TS_SDK_E2E_FILES = auto()
     ALL_PYPROJECT_TOML_FILES = auto()
     ALL_PYTHON_FILES = auto()
     ALL_SOURCE_FILES = auto()
@@ -234,7 +259,9 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
             r"^providers/common/messaging/.*",
         ],
         FileGroupForCi.JAVA_SDK_E2E_FILES: [
-            r"^java-sdk/.*",
+            # `.md` excluded — doc-only edits do not affect the Gradle build.
+            r"^java-sdk/(?!.*\.md$).*",
+            r"^airflow-e2e-tests/java-test-bundle/.*",
             r"^airflow-e2e-tests/tests/airflow_e2e_tests/java_sdk_tests/.*",
             r"^airflow-e2e-tests/docker/java\.yml$",
             r"^airflow-e2e-tests/docker/Dockerfile\.java$",
@@ -242,11 +269,36 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
             r"^task-sdk/src/airflow/sdk/coordinators/java/.*",
         ],
         FileGroupForCi.GO_SDK_E2E_FILES: [
-            r"^go-sdk/.*",
+            # `.md` excluded — doc-only edits do not affect the Go build or e2e tests.
+            r"^go-sdk/(?!.*\.md$).*",
             r"^airflow-e2e-tests/tests/airflow_e2e_tests/go_sdk_tests/.*",
             r"^airflow-e2e-tests/docker/go\.yml$",
             r"^task-sdk/src/airflow/sdk/coordinators/_subprocess\.py$",
             r"^task-sdk/src/airflow/sdk/coordinators/executable/.*",
+        ],
+        FileGroupForCi.OPENLINEAGE_E2E_FILES: [
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/openlineage_tests/.*",
+            r"^airflow-e2e-tests/docker/openlineage\.yml$",
+            r"^providers/openlineage/.*",
+            r"^providers/common/compat/.*",
+            r"^providers/common/io/.*",
+            r"^providers/common/sql/.*",
+        ],
+        FileGroupForCi.OPENLINEAGE_E2E_COMPAT_FILES: [
+            # Only add files that affect the compat setup and do NOT already trigger the full matrix
+            # here. The compat workflow (.github/workflows/openlineage-e2e-compat-tests.yml) is
+            # intentionally absent: it matches ENVIRONMENT_FILES and so already forces full_tests.
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/conftest\.py$",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/constants\.py$",
+            r"^airflow-e2e-tests/docker/openlineage-compat\.Dockerfile$",
+        ],
+        FileGroupForCi.TS_SDK_E2E_FILES: [
+            # API documentation entry points and Markdown do not affect runtime e2e tests.
+            r"^ts-sdk/(?!api-docs/)(?!.*\.md$).*",
+            r"^airflow-e2e-tests/tests/airflow_e2e_tests/ts_sdk_tests/.*",
+            r"^airflow-e2e-tests/docker/ts\.yml$",
+            r"^task-sdk/src/airflow/sdk/coordinators/_subprocess\.py$",
+            r"^task-sdk/src/airflow/sdk/coordinators/node/.*",
         ],
         FileGroupForCi.PYTHON_PRODUCTION_FILES: [
             # Production Python source the runtime ships — excludes tests, docs,
@@ -316,6 +368,7 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
         FileGroupForCi.DOC_FILES: [
             r"^docs",
             r"^devel-common/src/docs",
+            r"^devel-common/src/sphinx_exts",
             r"^\.github/SECURITY\.md",
             r"^providers/.*/docs/",
             r"^providers/.*/src/.*\.py$",
@@ -332,6 +385,10 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
             r"^airflow-ctl/docs",
             r"^airflow-ctl/src/.*\.py$",
             r"^airflow-ctl/tests/.*\.py$",
+            r"^dev/mypy/docs/",
+            r"^dev/mypy/src/.*\.py$",
+            r"^dev/mypy/RELEASE_NOTES\.rst$",
+            r"^dev/mypy/pyproject\.toml$",
             r"^CHANGELOG\.txt",
             r"^airflow-core/src/airflow/config_templates/config\.yml",
             r"^chart/RELEASE_NOTES\.rst",
@@ -346,6 +403,17 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
         FileGroupForCi.UI_FILES: [
             r"^airflow-core/src/airflow/ui/",
             r"^airflow-core/src/airflow/api_fastapi/auth/managers/simple/ui/",
+        ],
+        # The OpenAPI spec yamls that are inputs of the UI client codegen. Must cover the UNION of
+        # the openapi `files:` triggers of `ts-compile-lint-ui` and
+        # `ts-compile-lint-simple-auth-manager-ui` in `airflow-core/.pre-commit-config.yaml` —
+        # selective checks skip the two hooks as one unit, so this group is a strict superset of
+        # the first hook's triggers; do not "re-sync" it down to a single hook. A spec-only change
+        # (e.g. `_private_ui.yaml`) must not skip those hooks, otherwise a stale committed client
+        # masks type errors in CI (https://github.com/apache/airflow/pull/68919).
+        FileGroupForCi.UI_OPENAPI_FILES: [
+            r"^airflow-core/src/airflow/api_fastapi/core_api/openapi/.*\.yaml",
+            r"^airflow-core/src/airflow/api_fastapi/auth/managers/simple/openapi/.*\.yaml",
         ],
         FileGroupForCi.KUBERNETES_FILES: [
             r"^chart",
@@ -367,6 +435,7 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
         FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES: [
             r"^providers/.*/pyproject\.toml$",
             r"^providers/.*/provider\.yaml$",
+            r"^providers/\.pre-commit-config\.yaml$",
         ],
         FileGroupForCi.ALL_DEV_PYTHON_FILES: [
             r"^dev/.*\.py$",
@@ -420,8 +489,7 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
             r".*pyproject\.toml$",
         ],
         FileGroupForCi.TESTS_UTILS_FILES: [
-            r"^airflow-core/tests/unit/utils/",
-            r"^devel-common/.*\.py$",
+            r"^devel-common/src/tests_common/.*\.py$",
         ],
         FileGroupForCi.TASK_SDK_FILES: [
             r"^task-sdk/src/airflow/sdk/.*\.py$",
@@ -430,11 +498,43 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
         FileGroupForCi.TASK_SDK_INTEGRATION_TEST_FILES: [
             r"^task-sdk-integration-tests/.*\.py$",
         ],
+        FileGroupForCi.AGENT_FRAMEWORK_FILES: [
+            # The framework adapters sit on the framework-neutral tools, which sit on the toolsets,
+            # so any code change in the provider can break them, and so can a change to common.sql,
+            # which the SQL toolset uses, or to the locked versions the job holds the framework to.
+            # The job's own script and workflow are ENVIRONMENT_FILES, which run everything.
+            r"^providers/common/ai/(src|tests)/.*\.py$",
+            r"^providers/common/ai/pyproject\.toml$",
+            r"^providers/common/sql/src/.*\.py$",
+            r"^uv\.lock$",
+        ],
         FileGroupForCi.GO_SDK_FILES: [
-            r"^go-sdk/.*\.go$",
+            # `.md` excluded — doc-only edits do not affect the Go build or tests, but
+            # everything else (go.mod, go.sum, build config) must trigger the unit tests.
+            r"^go-sdk/(?!.*\.md$).*",
         ],
         FileGroupForCi.JAVA_SDK_FILES: [
-            r"^java-sdk/",
+            # `.md` excluded — doc-only edits do not affect the Gradle build.
+            r"^java-sdk/(?!.*\.md$).*",
+        ],
+        FileGroupForCi.TS_SDK_DOCS_FILES: [
+            # TypeDoc renders the reference from the SDK sources and category entry points,
+            # and the landing page is authored in ts-sdk/docs — unlike TS_SDK_FILES, `.md`
+            # counts here. tsconfig.json and package.json are included too: docs/tsconfig.json
+            # `extends` the former, and the latter pins the `@msgpack/msgpack` version the
+            # checked program depends on.
+            r"^ts-sdk/api-docs/.*",
+            r"^ts-sdk/docs/.*",
+            r"^ts-sdk/src/.*",
+            r"^ts-sdk/tsconfig\.json$",
+            r"^ts-sdk/package\.json$",
+        ],
+        FileGroupForCi.TS_SDK_FILES: [
+            # Documentation entry points and `.md` files do not affect the generated
+            # supervisor schema. `ts-sdk/docs/package.json` and its lock file are excluded
+            # too — they pin the docs toolchain's own dependencies and do not affect the SDK
+            # build.
+            r"^ts-sdk/(?!api-docs/)(?!.*\.md$)(?!docs/package(-lock)?\.json$).*",
         ],
         FileGroupForCi.ASSET_FILES: [
             r"^airflow-core/src/airflow/assets/",
@@ -478,7 +578,6 @@ CI_FILE_GROUP_MATCHES: HashableDict[FileGroupForCi] = HashableDict(
         FileGroupForCi.OTEL_FILES: [
             r"^airflow-core/src/airflow/observability/.*",
             r"^shared/observability/src/airflow_shared/observability/.*",
-            r"^airflow-core/src/airflow/utils/span_status\.py$",
             # The otel integration tests assert the exact span hierarchy that
             # task_runner emits, so changes to either must exercise the integration.
             r"^airflow-core/tests/integration/otel/.*",
@@ -590,6 +689,125 @@ def _matching_files(
     return matched_files
 
 
+TESTS_COMMON_SOURCE_ROOT = "devel-common/src/"
+TESTS_COMMON_PYTEST_PLUGIN = "devel-common/src/tests_common/pytest_plugin.py"
+# Only in these trees does a changed test file select the job that runs it; narrowing to an importer
+# elsewhere (e2e, python client, core integration, docker-tests) would skip tests the full matrix ran.
+TEST_HELPER_IMPORTER_ROOTS = (
+    "airflow-core/tests/system/",
+    "airflow-core/tests/unit/",
+    "airflow-ctl/tests/",
+    "airflow-ctl-tests/",
+    "kubernetes-tests/",
+    "providers/",
+    "shared/",
+    "task-sdk/tests/",
+    "task-sdk-integration-tests/",
+)
+
+
+def _imports_module(text: str, module: str, importer_package: str | None = None) -> bool:
+    """
+    Whether ``text`` imports ``module``.
+
+    ``importer_package`` is the dotted package of the importing file; relative imports are only resolved
+    when it is given.
+    """
+    package, _, name = module.rpartition(".")
+    if (
+        not re.search(rf"\b{re.escape(module)}\b", text)
+        and not (f"from {package} import" in text and re.search(rf"\b{re.escape(name)}\b", text))
+        and not (importer_package and re.search(r"^\s*from \.", text, re.MULTILINE))
+    ):
+        return False
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == module or alias.name.startswith(f"{module}.") for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                imported = node.module
+            elif importer_package:
+                base_parts = importer_package.split(".")
+                base = ".".join(base_parts[: len(base_parts) - (node.level - 1)])
+                imported = f"{base}.{node.module}" if node.module else base
+            else:
+                continue
+            if not imported:
+                continue
+            if imported == module or imported.startswith(f"{module}."):
+                return True
+            if imported == package and any(alias.name == name for alias in node.names):
+                return True
+    # Dotted references outside import statements, e.g. `pytest_plugins` entries.
+    return re.search(rf"\b{re.escape(module)}\b", text) is not None
+
+
+@clearable_cache
+def _find_test_helper_importers(helper: str) -> frozenset[str] | None:
+    """
+    Return the files outside ``tests_common`` that import ``helper``, directly or through other helpers.
+
+    ``None`` means the change cannot be narrowed down to its importers: the helper is loaded for every
+    test run (the pytest plugin, anything it imports, conftest and package ``__init__`` modules), it
+    no longer exists, the importers could not be searched, or an importer lies outside
+    ``TEST_HELPER_IMPORTER_ROOTS``.
+    """
+    if (
+        helper == TESTS_COMMON_PYTEST_PLUGIN
+        or Path(helper).name in ("conftest.py", "__init__.py")
+        or not (AIRFLOW_ROOT_PATH / helper).is_file()
+    ):
+        return None
+    importers: set[str] = set()
+    seen = {helper}
+    pending = [helper]
+    while pending:
+        module = pending.pop()[len(TESTS_COMMON_SOURCE_ROOT) :].removesuffix(".py").replace("/", ".")
+        result = run_command(
+            ["git", "grep", "-l", "-F", "-w", module.rpartition(".")[2], "--", "*.py"],
+            capture_output=True,
+            text=True,
+            cwd=AIRFLOW_ROOT_PATH,
+            check=False,
+            dry_run_override=False,
+        )
+        # git grep exits with 1 when nothing matches; anything else means the search did not happen.
+        if result.returncode not in (0, 1):
+            return None
+        for candidate in result.stdout.splitlines():
+            # CI never runs dev/ or scripts/ files as tests, and a dev/ importer would match
+            # ENVIRONMENT_FILES and force the full test matrix.
+            if candidate in seen or candidate.startswith(("dev/", "scripts/")):
+                continue
+            in_tests_common = candidate.startswith(f"{TESTS_COMMON_SOURCE_ROOT}tests_common/")
+            importer_package = (
+                str(Path(candidate[len(TESTS_COMMON_SOURCE_ROOT) :]).parent).replace("/", ".")
+                if in_tests_common
+                else None
+            )
+            text = (AIRFLOW_ROOT_PATH / candidate).read_text(errors="replace")
+            if not _imports_module(text, module, importer_package):
+                continue
+            seen.add(candidate)
+            if in_tests_common:
+                if candidate == TESTS_COMMON_PYTEST_PLUGIN or Path(candidate).name in (
+                    "conftest.py",
+                    "__init__.py",
+                ):
+                    return None
+                pending.append(candidate)
+            elif candidate.startswith(TEST_HELPER_IMPORTER_ROOTS):
+                importers.add(candidate)
+            else:
+                return None
+    return frozenset(importers)
+
+
 def _split_list(input_list, n) -> list[list[str]]:
     """
     Splits input_list into exactly n sub-lists, distributing items as evenly as possible.
@@ -616,11 +834,20 @@ def _split_list(input_list, n) -> list[list[str]]:
     ]
 
 
+def _strip_test_side_effect_providers(test_type: str) -> str:
+    """Drop the test side-effect providers so the description names the providers selected for the change."""
+    if not test_type.startswith("Providers[") or test_type.startswith("Providers[-"):
+        return test_type
+    providers = test_type.removeprefix("Providers[").removesuffix("]").split(",")
+    selected = [p for p in providers if p not in PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS]
+    return ",".join(selected or providers)
+
+
 def _get_test_type_description(provider_test_types: list[str]) -> str:
     if not provider_test_types:
         return ""
-    first_provider = provider_test_types[0]
-    last_provider = provider_test_types[-1]
+    first_provider = _strip_test_side_effect_providers(provider_test_types[0])
+    last_provider = _strip_test_side_effect_providers(provider_test_types[-1])
     if first_provider.startswith("Providers["):
         first_provider = first_provider.replace("Providers[", "").replace("]", "")
     if last_provider.startswith("Providers["):
@@ -655,8 +882,24 @@ class SelectiveChecks:
         github_repository: str = APACHE_AIRFLOW_GITHUB_REPOSITORY,
         github_actor: str = "",
         github_context_dict: dict[str, Any] | None = None,
+        platform: str = CI_AMD_PLATFORM,
     ):
         self._files = files
+        # A changed test helper selects the tests that import it, as if those test files had changed;
+        # only helpers that cannot be narrowed to their importers still force the full set of tests.
+        self._test_helpers_forcing_full_tests: tuple[str, ...] = ()
+        self._test_helpers_replaced_by_importers: tuple[str, ...] = ()
+        helper_importers: set[str] = set()
+        for helper in _matching_files(files, FileGroupForCi.TESTS_UTILS_FILES, CI_FILE_GROUP_MATCHES):
+            importers = _find_test_helper_importers(helper)
+            if importers is None:
+                self._test_helpers_forcing_full_tests += (helper,)
+            else:
+                self._test_helpers_replaced_by_importers += (helper,)
+                helper_importers |= importers
+        self._test_helper_importers = frozenset(helper_importers - set(files))
+        if helper_importers:
+            self._files = tuple(sorted(set(files) | helper_importers))
         self._default_branch = default_branch
         self._default_constraints_branch = default_constraints_branch
         self._commit_ref = commit_ref
@@ -665,6 +908,7 @@ class SelectiveChecks:
         self._github_repository = github_repository
         self._github_actor = github_actor
         self._github_context_dict = github_context_dict or {}
+        self._platform = platform
         self._new_toml: dict[str, Any] = {}
         self._old_toml: dict[str, Any] = {}
 
@@ -794,11 +1038,11 @@ class SelectiveChecks:
                 "and for now we have core tests depending on them.[/]"
             )
             return True
-        if self._matching_files(
-            FileGroupForCi.TESTS_UTILS_FILES,
-            CI_FILE_GROUP_MATCHES,
-        ):
-            console_print("[warning]Running full set of tests because tests/utils changed[/]")
+        if self._test_helpers_forcing_full_tests:
+            console_print(
+                "[warning]Running full set of tests because test helpers that cannot be narrowed to their "
+                f"importers changed: {', '.join(self._test_helpers_forcing_full_tests)}[/]"
+            )
             return True
         if FULL_TESTS_NEEDED_LABEL in self._pr_labels:
             console_print(
@@ -1033,6 +1277,25 @@ class SelectiveChecks:
         return self._should_be_run(FileGroupForCi.GO_SDK_E2E_FILES)
 
     @cached_property
+    def run_openlineage_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.OPENLINEAGE_E2E_FILES)
+
+    @cached_property
+    def run_openlineage_e2e_compat_tests(self) -> bool:
+        # Costly older-Airflow matrix. Like run_ui_e2e_tests it is not triggered by *derived*
+        # full_tests_needed (pushes, env changes, large PRs) — only by canary, an explicit label, or
+        # an actual change to a file that drives the compat setup but does not itself force the full
+        # matrix: the shared e2e harness (conftest / constants) or the compat Dockerfile. The compat
+        # workflow already forces full_tests_needed via ENVIRONMENT_FILES.
+        if self._is_canary_run() or FULL_TESTS_NEEDED_LABEL in self._pr_labels:
+            return True
+        return self._should_be_run(FileGroupForCi.OPENLINEAGE_E2E_COMPAT_FILES)
+
+    @cached_property
+    def run_ts_sdk_e2e_tests(self) -> bool:
+        return self._should_be_run(FileGroupForCi.TS_SDK_E2E_FILES)
+
+    @cached_property
     def run_amazon_tests(self) -> bool:
         if self.providers_test_types_list_as_strings_in_json == "[]":
             return False
@@ -1052,12 +1315,23 @@ class SelectiveChecks:
         )
 
     @cached_property
+    def run_agent_framework_tests(self) -> bool:
+        # Providers are released from main only, as for skip_providers_tests.
+        if self._default_branch != "main":
+            return False
+        return self._should_be_run(FileGroupForCi.AGENT_FRAMEWORK_FILES)
+
+    @cached_property
     def run_go_sdk_tests(self) -> bool:
         return self._should_be_run(FileGroupForCi.GO_SDK_FILES)
 
     @cached_property
     def run_java_sdk_tests(self) -> bool:
         return self._should_be_run(FileGroupForCi.JAVA_SDK_FILES)
+
+    @cached_property
+    def run_ts_sdk_docs(self) -> bool:
+        return self._should_be_run(FileGroupForCi.TS_SDK_DOCS_FILES)
 
     @cached_property
     def run_airflow_ctl_tests(self) -> bool:
@@ -1075,6 +1349,12 @@ class SelectiveChecks:
 
     @cached_property
     def run_kubernetes_tests(self) -> bool:
+        if AREA_KUBERNETES_TESTS_LABEL in self._pr_labels:
+            console_print(
+                "[warning]Running Kubernetes tests because "
+                f"label '{AREA_KUBERNETES_TESTS_LABEL}' is in {self._pr_labels}[/]"
+            )
+            return True
         return self._should_be_run(FileGroupForCi.KUBERNETES_FILES)
 
     @cached_property
@@ -1156,6 +1436,12 @@ class SelectiveChecks:
 
     @cached_property
     def prod_image_build(self) -> bool:
+        if AREA_E2E_TESTS_LABEL in self._pr_labels:
+            console_print(
+                "[warning]Building the PROD image to run Airflow E2E tests because "
+                f"label '{AREA_E2E_TESTS_LABEL}' is in {self._pr_labels}[/]"
+            )
+            return True
         return (
             self.run_kubernetes_tests
             or self.run_helm_tests
@@ -1168,6 +1454,9 @@ class SelectiveChecks:
             or self.run_event_driven_e2e_tests
             or self.run_java_sdk_e2e_tests
             or self.run_go_sdk_e2e_tests
+            or self.run_openlineage_e2e_tests
+            or self.run_openlineage_e2e_compat_tests
+            or self.run_ts_sdk_e2e_tests
             or self.run_ui_e2e_tests
         )
 
@@ -1297,11 +1586,50 @@ class SelectiveChecks:
                 for provider in providers_to_test:
                     candidate_test_types.add(f"Providers[{provider}]")
             else:
+                providers_to_test = self._add_providers_sharing_test_process_state(
+                    providers_to_test, changed_providers=self._find_changed_providers(), suspended=suspended
+                )
                 candidate_test_types.add(f"Providers[{','.join(sorted(providers_to_test))}]")
         sorted_candidate_test_types = sorted(candidate_test_types)
         console_print("[warning]Selected providers test type candidates to run:[/]")
         console_print(sorted_candidate_test_types)
         return sorted_candidate_test_types
+
+    def _find_changed_providers(self) -> set[str]:
+        """Providers whose own files changed, without their upstream and downstream dependents."""
+        return {
+            provider
+            for changed_file in self._files
+            if (provider := find_provider_affected(changed_file, include_docs=False))
+            not in (None, "Providers")
+        }
+
+    @staticmethod
+    def _add_providers_sharing_test_process_state(
+        providers_to_test: list[str], *, changed_providers: set[str], suspended: set[str]
+    ) -> list[str]:
+        """
+        Add the providers from PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS that precede a changed one.
+
+        Only providers whose own files changed count: a PR can make a provider's tests order-sensitive only
+        by changing that provider, and dependents pulled in for coverage keep their canary behaviour.
+        """
+
+        def get_test_folder(provider_id: str) -> str:
+            return provider_id.replace(".", "/")
+
+        changed_shared_process_providers = [
+            p for p in providers_to_test if p in changed_providers and p not in LONG_RUNNING_TEST_PROVIDERS
+        ]
+        if not changed_shared_process_providers:
+            return providers_to_test
+        last_folder = max(get_test_folder(p) for p in changed_shared_process_providers)
+        leaking_providers = [
+            p
+            for p in PROVIDERS_WITH_PROCESS_GLOBAL_TEST_SIDE_EFFECTS
+            if get_test_folder(p) < last_folder and p not in providers_to_test and p not in suspended
+        ]
+        return sorted([*providers_to_test, *leaking_providers])
 
     @staticmethod
     def _extract_long_provider_tests(current_test_types: set[str]):
@@ -1318,20 +1646,19 @@ class SelectiveChecks:
 
         :param current_test_types: The set of test types to run
         """
-        long_tests = ["amazon", "celery", "google", "standard"]
         for original_test_type in tuple(current_test_types):
             if original_test_type == "Providers":
                 current_test_types.remove(original_test_type)
-                for long_test in long_tests:
+                for long_test in LONG_RUNNING_TEST_PROVIDERS:
                     current_test_types.add(f"Providers[{long_test}]")
-                current_test_types.add(f"Providers[-{','.join(long_tests)}]")
+                current_test_types.add(f"Providers[-{','.join(LONG_RUNNING_TEST_PROVIDERS)}]")
             elif original_test_type.startswith("Providers["):
                 provider_tests_to_run = (
                     original_test_type.replace("Providers[", "").replace("]", "").split(",")
                 )
-                if any(long_test in provider_tests_to_run for long_test in long_tests):
+                if any(long_test in provider_tests_to_run for long_test in LONG_RUNNING_TEST_PROVIDERS):
                     current_test_types.remove(original_test_type)
-                    for long_test in long_tests:
+                    for long_test in LONG_RUNNING_TEST_PROVIDERS:
                         if long_test in provider_tests_to_run:
                             current_test_types.add(f"Providers[{long_test}]")
                             provider_tests_to_run.remove(long_test)
@@ -1349,7 +1676,7 @@ class SelectiveChecks:
 
     @cached_property
     def _platform_excluded_providers(self) -> set[str]:
-        """Provider ids that opt out of the current ``self.platform`` via provider.yaml.
+        """Provider ids that opt out of the current platform via provider.yaml.
 
         Mirrors the ``excluded-python-versions`` mechanism but keyed by Docker platform
         string (e.g. ``linux/arm64``) so providers whose native dependencies are unavailable
@@ -1357,7 +1684,7 @@ class SelectiveChecks:
         """
         excluded: set[str] = set()
         for provider_id, provider_info in get_provider_dependencies().items():
-            if self.platform in provider_info.get("excluded-platforms", []):
+            if self._platform in provider_info.get("excluded-platforms", []):
                 excluded.add(provider_id)
         return excluded
 
@@ -1497,11 +1824,6 @@ class SelectiveChecks:
                 f"Could not get pyproject.toml from {self._commit_ref}^[/]"
             )
             return False
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib  # type: ignore[no-redef]
-
         self._new_toml = tomllib.loads(new_result.stdout)
         self._old_toml = tomllib.loads(old_result.stdout)
         return True
@@ -1562,6 +1884,8 @@ class SelectiveChecks:
             packages.append("task-sdk")
         if any(file.startswith("airflow-ctl/") for file in self._files):
             packages.append("apache-airflow-ctl")
+        if any(file.startswith("dev/mypy/") for file in self._files):
+            packages.append("apache-airflow-mypy")
         if providers_affected:
             suspended = set(get_suspended_provider_ids())
             for provider in providers_affected:
@@ -1596,7 +1920,9 @@ class SelectiveChecks:
             return ",".join(sorted(prek_hooks_to_skip))
         if not (
             self._matching_files(FileGroupForCi.UI_FILES, CI_FILE_GROUP_MATCHES)
-            or self._matching_files(FileGroupForCi.API_CODEGEN_FILES, CI_FILE_GROUP_MATCHES)
+            # An API_CODEGEN_FILES disjunct would be unreachable here — matching that group
+            # forces full_tests_needed, and skip_prek_hooks returns early above in that case.
+            or self._matching_files(FileGroupForCi.UI_OPENAPI_FILES, CI_FILE_GROUP_MATCHES)
         ):
             prek_hooks_to_skip.add("ts-compile-lint-ui")
             prek_hooks_to_skip.add("ts-compile-lint-simple-auth-manager-ui")
@@ -1612,14 +1938,26 @@ class SelectiveChecks:
             # on a cold cache. Skip it when no java-sdk files changed so unrelated PRs do not
             # depend on that (intermittently failing) download.
             prek_hooks_to_skip.add("ktlint")
+            # Rewriting the verification metadata resolves the entire Java SDK dependency graph
+            # from Maven Central. Skip it when no java-sdk files changed so unrelated PRs do not
+            # depend on that resolution.
+            prek_hooks_to_skip.add("regenerate-java-sdk-verification-metadata")
+        if not self._matching_files(FileGroupForCi.TS_SDK_FILES, CI_FILE_GROUP_MATCHES):
+            # This hook regenerates ts-sdk/src/generated/supervisor.ts from the wire schema and
+            # diffs it. Schema-only changes deliberately do not trigger it: regenerating the
+            # ts-sdk types is the ts-sdk follow-up PR's job, not the schema author's.
+            prek_hooks_to_skip.add("check-ts-sdk-supervisor-schema")
         if not (
             self._matching_files(
                 FileGroupForCi.ALL_PROVIDERS_DISTRIBUTION_CONFIG_FILES, CI_FILE_GROUP_MATCHES
             )
             or self._matching_files(FileGroupForCi.ALL_PROVIDERS_PYTHON_FILES, CI_FILE_GROUP_MATCHES)
+            or self._matching_files(FileGroupForCi.PREK_FILES, CI_FILE_GROUP_MATCHES)
         ):
-            # only skip provider validation if none of the provider.yaml and provider
-            # python files changed because validation also walks through all the provider python files
+            # Skip provider validation only when none of these changed:
+            # - provider.yaml / pyproject.toml / providers/.pre-commit-config.yaml
+            # - provider Python files (validation walks all provider Python files)
+            # - prek scripts (the check script itself may have changed)
             prek_hooks_to_skip.add("check-provider-yaml-valid")
         # Non-provider mypy checks run as prek hooks in static checks.
         # Skip them when their relevant files haven't changed, unless devel-common
@@ -1747,80 +2085,6 @@ class SelectiveChecks:
         suspended = set(get_suspended_provider_ids())
         return " ".join(sorted(p for p in affected_providers if p not in suspended))
 
-    def get_job_label(self, event_type: str, branch: str):
-        import requests  # type: ignore[import-untyped]
-
-        # The main CI is now split into ci-arm.yml and ci-amd.yml; the old
-        # ci-amd-arm.yml file no longer exists. This lookup is dormant for the
-        # main pipeline (which hardcodes runner-type per wrapper) and only
-        # remains here for the `is_disabled_integration` code path that still
-        # reads `runner_type`. The API call against a missing workflow returns
-        # nothing and the caller falls back to PUBLIC_AMD_RUNNERS.
-        job_name = "Basic tests"
-        workflow_name = "ci-amd-arm.yml"
-        headers = {"Accept": "application/vnd.github.v3+json"}
-        if os.environ.get("GITHUB_TOKEN"):
-            headers["Authorization"] = f"token {os.environ.get('GITHUB_TOKEN')}"
-
-        url = f"https://api.github.com/repos/{self._github_repository}/actions/workflows/{workflow_name}/runs"
-        payload = {"event": event_type, "status": "completed", "branch": branch}
-
-        response = requests.get(url, headers=headers, params=payload)
-        if response.status_code != 200:
-            try:
-                error_msg = response.json()
-            except ValueError:
-                error_msg = response.text[:200]  # Truncate long HTML responses
-            console_print(f"[red]Error while listing workflow runs error: {error_msg}.\n")
-            return None
-        runs = response.json().get("workflow_runs", [])
-        if not runs:
-            console_print(
-                f"[yellow]No runs information found for workflow {workflow_name}, params: {payload}.\n"
-            )
-            return None
-        jobs_url = runs[0].get("jobs_url")
-        jobs_response = requests.get(jobs_url, headers=headers)
-        if jobs_response.status_code != 200:
-            try:
-                error_msg = jobs_response.json()
-            except ValueError:
-                error_msg = jobs_response.text[:200]
-            console_print(f"[red]Error while listing jobs error: {error_msg}.\n")
-            return None
-        jobs = jobs_response.json().get("jobs", [])
-        if not jobs:
-            console_print("[yellow]No jobs information found for jobs %s.\n", jobs_url)
-            return None
-
-        for job in jobs:
-            if job_name in job.get("name", ""):
-                runner_labels = job.get("labels", [])
-                if "windows-2025" in runner_labels:
-                    continue
-                if not runner_labels:
-                    console_print("[yellow]No labels found for job {job_name}.\n", jobs_url)
-                    return None
-                return runner_labels[0]
-
-        return None
-
-    @cached_property
-    def runner_type(self):
-        if self._github_event in [GithubEvents.SCHEDULE, GithubEvents.PUSH]:
-            branch = self._github_context_dict.get("ref_name", "main")
-            label = self.get_job_label(event_type=str(self._github_event.value), branch=branch)
-
-            return RUNNERS_TYPE_CROSS_MAPPING.get(label, PUBLIC_AMD_RUNNERS) if label else PUBLIC_AMD_RUNNERS
-
-        return PUBLIC_AMD_RUNNERS
-
-    @cached_property
-    def platform(self):
-        if "arm" in self.runner_type:
-            return "linux/arm64"
-        return "linux/amd64"
-
     @cached_property
     def amd_runners(self) -> str:
         return PUBLIC_AMD_RUNNERS
@@ -1857,10 +2121,8 @@ class SelectiveChecks:
         return json.dumps(sorted_providers_to_exclude)
 
     def _is_disabled_integration(self, integration: str) -> bool:
-        return (
-            integration in DISABLE_TESTABLE_INTEGRATIONS_FROM_CI
-            or integration in DISABLE_TESTABLE_INTEGRATIONS_FROM_ARM
-            and self.runner_type in PUBLIC_ARM_RUNNERS
+        return integration in DISABLE_TESTABLE_INTEGRATIONS_FROM_CI or (
+            integration in DISABLE_TESTABLE_INTEGRATIONS_FROM_ARM and self._platform == CI_ARM_PLATFORM
         )
 
     @cached_property
@@ -1915,12 +2177,15 @@ class SelectiveChecks:
         all_providers_affected = False
         suspended_providers: set[str] = set()
         for changed_file in self._files:
+            if changed_file in self._test_helpers_replaced_by_importers:
+                continue
             provider = find_provider_affected(changed_file, include_docs=include_docs)
             if provider == "Providers":
                 all_providers_affected = True
             elif provider is not None:
                 if provider not in get_provider_dependencies():
-                    suspended_providers.add(provider)
+                    if changed_file not in self._test_helper_importers:
+                        suspended_providers.add(provider)
                 else:
                     affected_providers.add(provider)
         if self.run_api_tests:
@@ -1996,11 +2261,6 @@ class SelectiveChecks:
         )
         if not pyproject_files or not self._github_event == GithubEvents.PULL_REQUEST:
             return False
-
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib  # type: ignore[no-redef]
 
         violations = []
         for pyproject_file in pyproject_files:
@@ -2147,12 +2407,17 @@ class SelectiveChecks:
 
     def _has_common_compat_changed(self) -> bool:
         """Check if any common.compat provider file was changed."""
-        return any(f.startswith("providers/common/compat/") for f in self._files)
+        return any(
+            f.startswith("providers/common/compat/") and f not in self._test_helper_importers
+            for f in self._files
+        )
 
     def _get_changed_providers_excluding_common_compat(self) -> set[str]:
         """Get set of changed providers excluding common.compat itself."""
         changed_providers: set[str] = set()
         for changed_file in self._files:
+            if changed_file in self._test_helper_importers:
+                continue
             provider = find_provider_affected(changed_file, include_docs=False)
             if provider and provider not in ["common.compat", "Providers"]:
                 changed_providers.add(provider)

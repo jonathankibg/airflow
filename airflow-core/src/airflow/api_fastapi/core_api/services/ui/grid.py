@@ -27,7 +27,6 @@ import structlog
 
 from airflow.api_fastapi.common.parameters import state_priority
 from airflow.api_fastapi.core_api.services.ui.task_group import get_task_group_children_getter
-from airflow.models.taskmap import TaskMap
 from airflow.serialization.definitions.baseoperator import SerializedBaseOperator
 from airflow.serialization.definitions.mappedoperator import SerializedMappedOperator
 from airflow.serialization.definitions.taskgroup import SerializedTaskGroup
@@ -142,9 +141,10 @@ def _get_aggs_for_node(summary: GridNodeAgg) -> dict[str, Any]:
 
 
 def _find_aggregates(
-    node: SerializedTaskGroup | SerializedBaseOperator | TaskMap,
-    parent_node: SerializedTaskGroup | SerializedBaseOperator | TaskMap | None,
+    node: SerializedTaskGroup | SerializedBaseOperator,
+    parent_node: SerializedTaskGroup | SerializedBaseOperator | None,
     ti_details: Mapping[str, GridNodeAgg],
+    group_dict: dict[str | None, SerializedTaskGroup] | None = None,
 ) -> Iterable[tuple[dict[str, Any], GridNodeAgg]]:
     """Recursively fill the Task Group Map."""
     node_id = node.node_id
@@ -171,10 +171,12 @@ def _find_aggregates(
 
         return
     if isinstance(node, SerializedTaskGroup):
+        if group_dict is None:
+            group_dict = node.dag.task_group.get_task_group_dict()
         children_summary = GridNodeAgg()
-        for child in get_task_group_children_getter()(node):
+        for child in get_task_group_children_getter()(node, group_dict):
             for child_node, child_summary in _find_aggregates(
-                node=child, parent_node=node, ti_details=ti_details
+                node=child, parent_node=node, ti_details=ti_details, group_dict=group_dict
             ):
                 if child_node["parent_id"] == node_id:
                     children_summary.merge(child_summary)

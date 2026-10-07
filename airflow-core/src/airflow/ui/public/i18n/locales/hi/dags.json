@@ -76,6 +76,11 @@
       "upstream": "अपस्ट्रीम"
     }
   },
+  "runStateCounts": {
+    "label": "रन स्थितियां",
+    "loading": "रन स्थिति गणना लोड हो रही है",
+    "tooltip": "{{state}}: {{formattedCount}} — रन फ़िल्टर करने के लिए क्लिक करें"
+  },
   "search": {
     "advanced": "उन्नत खोज",
     "clear": "खोज साफ करें",

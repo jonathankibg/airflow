@@ -44,12 +44,17 @@ in a non-Python implementation.
      - :class:`task-sdk:airflow.sdk.coordinators.executable.ExecutableCoordinator`
      - None (native binary)
      - :doc:`go`
+   * - TypeScript
+     - :class:`task-sdk:airflow.sdk.coordinators.node.NodeCoordinator`
+     - Node.js 22
+     - :doc:`typescript`
 
 .. toctree::
    :hidden:
 
    java
    go
+   typescript
 
 How it works
 ------------
@@ -122,6 +127,13 @@ XCom references should be defined inside the Python Dag (they are task dependenc
 actually read the values out in the language implementation, and vice versa. See specific language SDK
 documentation on how to do this correctly.
 
+.. note::
+
+    For a Dag containing stub tasks, the **Code** view in the Airflow UI shows only the Python Dag
+    file — including the stub declarations — as the Dag's source. The non-Python implementation source
+    is not displayed anywhere in the UI; consult your project repository or the build artifact shipped
+    in the bundle to inspect it. This is an intentional architecture decision, not a bug.
+
 .. _language-sdks/coordinator-config:
 
 Coordinator configuration
@@ -143,9 +155,9 @@ Coordinators are registered in ``airflow.cfg`` (or via environment variables) un
             }
         }
 
-    The ``classpath`` value must be importable by the worker.  The ``kwargs`` are passed directly
-    to the coordinator's constructor.  See the language-specific guide for the accepted kwargs
-    of each coordinator (e.g. :ref:`java-sdk/coordinator-config` for
+    The ``classpath`` value must be importable by the worker and the Dag processor.  The ``kwargs``
+    are passed directly to the coordinator's constructor.  See the language-specific guide for the
+    accepted kwargs of each coordinator (e.g. :ref:`java-sdk/coordinator-config` for
     :class:`~airflow.sdk.coordinators.java.JavaCoordinator`).
 
     ``extra`` is an optional object for any additional information you want to associate with a

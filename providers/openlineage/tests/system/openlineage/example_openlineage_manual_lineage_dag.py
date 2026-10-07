@@ -46,6 +46,7 @@ except ImportError:
     from airflow.decorators import dag, task  # type: ignore[no-redef, attr-defined]
     from airflow.operators.python import get_current_context  # type: ignore[no-redef]
 
+from system.openlineage.constants import DEFAULT_DAGRUN_TIMEOUT
 from system.openlineage.expected_events import get_expected_event_file_path
 from system.openlineage.operator import OpenLineageTestOperator
 
@@ -71,6 +72,7 @@ DAG_ID = "openlineage_manual_lineage_dag"
 
 
 @dag(
+    dagrun_timeout=DEFAULT_DAGRUN_TIMEOUT,
     dag_id=DAG_ID,
     start_date=dt.datetime(2024, 1, 1),
     schedule=None,
@@ -125,8 +127,8 @@ def openlineage_manual_lineage_dag():
         ctx = get_current_context()
         ti = ctx["task_instance"]
 
-        start = dt.datetime(2024, 5, 1, 10, 0, 0, tzinfo=dt.timezone.utc)
-        end = dt.datetime(2024, 5, 1, 10, 0, 5, tzinfo=dt.timezone.utc)
+        start = dt.datetime(2024, 5, 1, 10, 0, 0, tzinfo=dt.UTC)
+        end = dt.datetime(2024, 5, 1, 10, 0, 5, tzinfo=dt.UTC)
 
         emit_query_lineage(
             query_id="qid-max-1",

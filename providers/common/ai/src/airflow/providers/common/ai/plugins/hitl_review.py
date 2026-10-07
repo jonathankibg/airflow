@@ -17,12 +17,17 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import urlparse
 
 from airflow.plugins_manager import AirflowPlugin
 from airflow.providers.common.compat.sdk import conf
-from airflow.providers.common.compat.version_compat import AIRFLOW_V_3_1_PLUS
+from airflow.providers.common.compat.version_compat import AIRFLOW_V_3_1_PLUS, get_base_airflow_version_tuple
+
+AIRFLOW_V_3_4_PLUS = get_base_airflow_version_tuple() >= (3, 4, 0)
+
+if TYPE_CHECKING:
+    from airflow.plugins_manager import FastAPIAppDict, ReactAppDict
 
 _PLUGIN_PREFIX = "/hitl-review"
 
@@ -57,15 +62,15 @@ def _get_bundle_url() -> str:
 if AIRFLOW_V_3_1_PLUS:
     import mimetypes
     from pathlib import Path
-    from types import SimpleNamespace
 
     from fastapi import Depends, FastAPI, HTTPException, Query
     from fastapi.staticfiles import StaticFiles
-    from sqlalchemy import select
+    from sqlalchemy import delete, select
     from sqlalchemy.orm import Session
 
     from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity
     from airflow.api_fastapi.core_api.security import requires_access_dag
+    from airflow.models.dagrun import DagRun
     from airflow.models.taskinstance import TaskInstance as TI
     from airflow.models.xcom import XComModel
     from airflow.providers.common.ai.utils.hitl_review import (
@@ -79,8 +84,8 @@ if AIRFLOW_V_3_1_PLUS:
         HumanFeedbackRequest,
         SessionStatus,
     )
+    from airflow.sdk import TaskInstanceState
     from airflow.utils.session import create_session
-    from airflow.utils.state import TaskInstanceState
 
     def _get_session():
         with create_session(scoped=False) as session:
@@ -92,54 +97,97 @@ if AIRFLOW_V_3_1_PLUS:
         session: Session, *, dag_id: str, run_id: str, task_id: str, map_index: int = -1, key: str
     ):
         """Read a single XCom value from the database."""
-        row = session.scalars(
-            XComModel.get_many(
-                run_id=run_id,
-                key=key,
-                dag_ids=dag_id,
-                task_ids=task_id,
-                map_indexes=map_index,
-                limit=1,
-            )
-        ).first()
+        read = XComModel.get_many(
+            run_id=run_id,
+            key=key,
+            dag_ids=dag_id,
+            task_ids=task_id,
+            map_indexes=map_index,
+            limit=1,
+        )
+        row = session.scalars(read).first()
         if row is None:
             return None
-        return XComModel.deserialize_value(row)
+        return row.value
 
     def _read_xcom_by_prefix(
         session: Session, *, dag_id: str, run_id: str, task_id: str, map_index: int = -1, prefix: str
     ) -> dict[int, Any]:
         """Read all iteration-keyed XCom entries matching *prefix* (e.g. ``airflow_hitl_review_agent_output_``)."""
-        query = select(XComModel.key, XComModel.value).where(
-            XComModel.dag_id == dag_id,
-            XComModel.run_id == run_id,
-            XComModel.task_id == task_id,
-            XComModel.map_index == map_index,
-            XComModel.key.like(f"{prefix}%"),
-        )
+        if AIRFLOW_V_3_4_PLUS:
+            read = XComModel.get_many(
+                run_id=run_id,
+                dag_ids=dag_id,
+                task_ids=task_id,
+                map_indexes=map_index,
+            )
+            entity = read.column_descriptions[0]["entity"]
+            query = read.with_only_columns(entity.key, entity.value).where(entity.key.like(f"{prefix}%"))
+        else:
+            query = select(XComModel.key, XComModel.value).where(
+                XComModel.dag_id == dag_id,
+                XComModel.run_id == run_id,
+                XComModel.task_id == task_id,
+                XComModel.map_index == map_index,
+                XComModel.key.like(f"{prefix}%"),
+            )
         result: dict[int, Any] = {}
         for key, value in session.execute(query).all():
             suffix = key[len(prefix) :]
             if suffix.isdigit():
-                # deserialize_value expects an object with a .value attribute;
-                # wrap the raw column value so we can reuse the standard deserialization path.
-                row = SimpleNamespace(value=value)
-                result[int(suffix)] = XComModel.deserialize_value(row)
+                result[int(suffix)] = value
         return result
 
     def _write_xcom(
         session: Session, *, dag_id: str, run_id: str, task_id: str, map_index: int = -1, key: str, value
     ):
         """Write data to db."""
-        XComModel.set(
-            key=key,
-            value=value,
-            dag_id=dag_id,
-            task_id=task_id,
-            run_id=run_id,
-            map_index=map_index,
-            session=session,
+        if AIRFLOW_V_3_4_PLUS:
+            owner = session.scalar(
+                select(TI.id).where(
+                    TI.working_set.is_(True),
+                    TI.dag_id == dag_id,
+                    TI.run_id == run_id,
+                    TI.task_id == task_id,
+                    TI.map_index == map_index,
+                )
+            )
+            if owner is None:
+                raise HTTPException(404, f"Task instance not found on DAG {dag_id!r} with ID {run_id!r}")
+            XComModel.set_for_attempt(
+                task_instance_id=owner,
+                key=key,
+                value=value,
+                serialize=False,
+                session=session,
+            )
+            return
+
+        # Stores value natively to match worker-written XComs; use XComModel.set(serialize=False) once min Airflow >= 3.2.
+        dag_run_id = session.scalar(select(DagRun.id).where(DagRun.dag_id == dag_id, DagRun.run_id == run_id))
+        if dag_run_id is None:
+            raise HTTPException(404, f"DAG run not found on DAG {dag_id!r} with ID {run_id!r}")
+        session.execute(
+            delete(XComModel).where(
+                XComModel.key == key,
+                XComModel.run_id == run_id,
+                XComModel.task_id == task_id,
+                XComModel.dag_id == dag_id,
+                XComModel.map_index == map_index,
+            )
         )
+        session.add(
+            XComModel(
+                dag_run_id=dag_run_id,
+                key=key,
+                value=value,
+                run_id=run_id,
+                task_id=task_id,
+                dag_id=dag_id,
+                map_index=map_index,
+            )
+        )
+        session.flush()
 
     _RUNNING_TI_STATES = frozenset(
         {
@@ -155,14 +203,15 @@ if AIRFLOW_V_3_1_PLUS:
         session: Session, *, dag_id: str, run_id: str, task_id: str, map_index: int = -1
     ) -> bool:
         """Return True if the task instance is no longer running."""
-        state = session.scalar(
-            select(TI.state).where(
-                TI.dag_id == dag_id,
-                TI.run_id == run_id,
-                TI.task_id == task_id,
-                TI.map_index == map_index,
-            )
+        query = select(TI.state).where(
+            TI.dag_id == dag_id,
+            TI.run_id == run_id,
+            TI.task_id == task_id,
+            TI.map_index == map_index,
         )
+        if AIRFLOW_V_3_4_PLUS:
+            query = query.where(TI.working_set.is_(True))
+        state = session.scalar(query)
         if state is None:
             return True
         return state not in _RUNNING_TI_STATES
@@ -495,8 +544,8 @@ class HITLReviewPlugin(AirflowPlugin):
     """Register the HITL Review REST API + chat UI on the Airflow API server."""
 
     name = "hitl_review"
-    fastapi_apps: list[dict[str, Any]] = []
-    react_apps: list[dict[str, str]] = []
+    fastapi_apps: list[FastAPIAppDict] = []
+    react_apps: list[ReactAppDict] = []
     if AIRFLOW_V_3_1_PLUS:
         fastapi_apps = [
             {

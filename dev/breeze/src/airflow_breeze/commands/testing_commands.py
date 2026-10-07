@@ -29,7 +29,7 @@ from time import sleep
 import click
 from click import IntRange
 
-from airflow_breeze.commands.ci_image_commands import rebuild_or_pull_ci_image_if_needed
+from airflow_breeze.commands.ci_image_commands import build_ci_image_if_needed
 from airflow_breeze.commands.common_options import (
     option_airflow_ui_base_url,
     option_allow_pre_releases,
@@ -62,6 +62,7 @@ from airflow_breeze.commands.common_options import (
     option_no_db_cleanup,
     option_parallelism,
     option_postgres_version,
+    option_project_name,
     option_providers_integration,
     option_python,
     option_run_db_tests_only,
@@ -104,6 +105,7 @@ from airflow_breeze.utils.docker_command_utils import (
     fix_ownership_using_docker,
     notify_on_unhealthy_backend_container,
     perform_environment_checks,
+    pull_images_with_retries,
     remove_docker_networks,
 )
 from airflow_breeze.utils.environment_check import is_ci_environment
@@ -113,7 +115,13 @@ from airflow_breeze.utils.parallel import (
     check_async_run_results,
     run_with_pool,
 )
-from airflow_breeze.utils.path_utils import AIRFLOW_CTL_ROOT_PATH, FILES_PATH, cleanup_python_generated_files
+from airflow_breeze.utils.path_utils import (
+    AIRFLOW_CTL_ROOT_PATH,
+    AIRFLOW_ROOT_PATH,
+    FILES_PATH,
+    cleanup_python_generated_files,
+    get_default_project_name,
+)
 from airflow_breeze.utils.run_tests import (
     TASK_SDK_INTEGRATION_TESTS_ROOT_PATH,
     are_all_test_paths_excluded,
@@ -194,6 +202,8 @@ TEST_PROGRESS_REGEXP = (
     r"airflow-core/tests/.*|providers/.*/tests/.*|task-sdk/tests/.*|airflow-ctl/tests/.*|.*=====.*"
 )
 PERCENT_TEST_PROGRESS_REGEXP = r"^tests/.*\[[ \d%]*\].*|^\..*\[[ \d%]*\].*"
+# pytest.ExitCode.NO_TESTS_COLLECTED - spelled out so that breeze does not have to import pytest
+PYTEST_NO_TESTS_COLLECTED_EXIT_CODE = 5
 
 
 def _run_test(
@@ -270,6 +280,12 @@ def _run_test(
     run_cmd.extend(pytest_args)
     try:
         remove_docker_networks(networks=[f"{compose_project_name}_default"])
+        if shell_params.test_group in (GroupOfTests.INTEGRATION_CORE, GroupOfTests.INTEGRATION_PROVIDERS):
+            pull_images_with_retries(
+                compose_project_name=compose_project_name,
+                env=env,
+                skip_images={shell_params.airflow_image_name},
+            )
         result = run_command(
             run_cmd,
             output=output,
@@ -277,6 +293,14 @@ def _run_test(
             output_outside_the_group=output_outside_the_group,
             env=env,
         )
+        if shell_params.run_db_tests_only and result.returncode == PYTEST_NO_TESTS_COLLECTED_EXIT_CODE:
+            # --run-db-tests-only deselects non-DB tests at collection time, so a test type without DB
+            # tests collects nothing. This must be decided here, per test type: the parallel run turns
+            # any non-zero code into exit code 1, which looks the same as a failing test.
+            get_console(output=output).print(
+                f"[info]No DB tests collected for {shell_params.test_type}. Nothing to run.[/]"
+            )
+            return 0, f"No DB tests collected: {shell_params.test_type}"
         if result.returncode != 0:
             notify_on_unhealthy_backend_container(
                 project_name=compose_project_name, backend=shell_params.backend, output=output
@@ -311,9 +335,9 @@ def _get_project_names(shell_params: ShellParams) -> tuple[str, str]:
     """Return compose project name and project name."""
     project_name = file_name_from_test_type(shell_params.test_type)
     if shell_params.test_type == ALL_TEST_TYPE:
-        compose_project_name = "breeze-airflow-test"
+        compose_project_name = f"{shell_params.project_name}-airflow-test"
     else:
-        compose_project_name = f"breeze-airflow-test-{project_name}"
+        compose_project_name = f"{shell_params.project_name}-airflow-test-{project_name}"
     return compose_project_name, project_name
 
 
@@ -694,6 +718,7 @@ option_total_test_timeout = click.option(
 @option_parallel_core_test_types
 @option_parallelism
 @option_postgres_version
+@option_project_name
 @option_python
 @option_run_db_tests_only
 @option_run_in_parallel
@@ -758,6 +783,7 @@ def core_tests(**kwargs):
 @option_parallel_providers_test_types
 @option_parallelism
 @option_postgres_version
+@option_project_name
 @option_providers_constraints_location
 @option_providers_skip_constraints
 @option_python
@@ -1415,7 +1441,7 @@ def python_api_client_tests(
         install_airflow_python_client=True,
         start_api_server_with_examples=True,
     )
-    rebuild_or_pull_ci_image_if_needed(command_params=shell_params)
+    build_ci_image_if_needed(command_params=shell_params)
     fix_ownership_using_docker()
     cleanup_python_generated_files()
     perform_environment_checks()
@@ -1429,6 +1455,66 @@ def python_api_client_tests(
         skip_docker_compose_down=skip_docker_compose_down,
     )
     sys.exit(returncode)
+
+
+# Providers reinstalled from main onto the released Airflow base for the OpenLineage compat image:
+# OpenLineage plus the providers its system-test DAGs import.
+OPENLINEAGE_E2E_COMPAT_PROVIDERS = ["openlineage", "standard", "common.compat", "common.sql", "common.io"]
+
+
+def _build_openlineage_e2e_compat_image(airflow_version: str, python: str) -> str:
+    """Build a lightweight image: released ``apache/airflow:<version>`` + current OL providers from main.
+
+    Replicates the provider-compatibility approach (current provider code on an older Airflow version)
+    without a full PROD image build — the released image is pulled and the providers are reinstalled
+    from wheels built from main.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    console_print(f"[info]Building provider wheels from main: {OPENLINEAGE_E2E_COMPAT_PROVIDERS}[/]")
+    run_command(
+        [
+            "breeze",
+            "release-management",
+            "prepare-provider-distributions",
+            *OPENLINEAGE_E2E_COMPAT_PROVIDERS,
+            "--distribution-format",
+            "wheel",
+            "--skip-tag-check",
+            "--include-not-ready-providers",
+            "--clean-dist",
+        ],
+        check=True,
+        cwd=AIRFLOW_ROOT_PATH,
+    )
+    build_context = Path(tempfile.mkdtemp(prefix="ol-e2e-compat-"))
+    provider_dist = build_context / "provider_dist"
+    provider_dist.mkdir()
+    for wheel in (AIRFLOW_ROOT_PATH / "dist").glob("*.whl"):  # --clean-dist above leaves only our wheels
+        shutil.copy2(wheel, provider_dist / wheel.name)
+    shutil.copy2(
+        AIRFLOW_ROOT_PATH / "airflow-e2e-tests" / "docker" / "openlineage-compat.Dockerfile",
+        build_context / "Dockerfile",
+    )
+
+    base_image = f"apache/airflow:{airflow_version}-python{python}"
+    image_name = f"openlineage-e2e/airflow:{airflow_version}-python{python}"
+    console_print(f"[info]Building {image_name} from {base_image}[/]")
+    run_command(
+        [
+            "docker",
+            "build",
+            "--build-arg",
+            f"AIRFLOW_BASE_IMAGE={base_image}",
+            "-t",
+            image_name,
+            build_context.as_posix(),
+        ],
+        check=True,
+    )
+    return image_name
 
 
 option_e2e_test_mode = click.option(
@@ -1447,6 +1533,8 @@ option_e2e_test_mode = click.option(
             "event_driven",
             "java_sdk",
             "go_sdk",
+            "openlineage",
+            "ts_sdk",
         ],
         case_sensitive=False,
     ),
@@ -1468,6 +1556,13 @@ option_e2e_test_mode = click.option(
 @option_verbose
 @option_dry_run
 @option_e2e_test_mode
+@click.option(
+    "--airflow-version",
+    help="Run the openlineage mode against a released Airflow version (e.g. 3.1.8) with current "
+    "providers from main, instead of the default PROD image. Builds a lightweight image from "
+    "apache/airflow:<version>. Only used by the openlineage compat matrix.",
+    default=None,
+)
 @click.argument("extra_pytest_args", nargs=-1, type=click.Path(path_type=str))
 def airflow_e2e_tests(
     python: str,
@@ -1476,19 +1571,28 @@ def airflow_e2e_tests(
     github_repository: str,
     include_success_outputs: bool,
     e2e_test_mode: str,
+    airflow_version: str | None,
     extra_pytest_args: tuple,
 ):
     """Run Airflow E2E tests."""
 
     perform_environment_checks()
     image_name = image_name or os.environ.get("DOCKER_IMAGE")
-    if image_name is None or image_name.strip() == "":
+    if image_name and image_name.strip() == "":
+        image_name = None
+    if airflow_version:
+        # prepare_dags.py reads this to drop DAGs that need a newer Airflow than the target.
+        os.environ["E2E_TARGET_AIRFLOW_VERSION"] = airflow_version
+        if not image_name:
+            image_name = _build_openlineage_e2e_compat_image(airflow_version, python)
+    elif not image_name:
         build_params = BuildProdParams(python=python, github_repository=github_repository)
         image_name = build_params.airflow_image_name
 
-    console_print(f"[info]Running Airflow E2E tests with PROD image: {image_name}[/]")
-    # If the image is used from docker hub, test container will pull that part of test.
-    skip_image_check = bool(image_name and image_name.startswith("apache/airflow"))
+    console_print(f"[info]Running Airflow E2E tests with image: {image_name}[/]")
+    # If the image is used from docker hub, test container will pull that part of test. A locally
+    # built compat image (--airflow-version) is present on the host, so skip the check for it too.
+    skip_image_check = bool(image_name and image_name.startswith("apache/airflow")) or bool(airflow_version)
     return_code, info = run_docker_compose_tests(
         image_name=image_name,
         python_version=python,
@@ -1616,6 +1720,8 @@ def ui_e2e_tests(
             "TEST_PASSWORD": test_admin_password,
             "TEST_DAG_ID": "example_bash_operator",
         }
+        if browser != "all":
+            env_vars["TEST_BROWSER"] = browser
 
         if force_reinstall_deps:
             clean_cmd = ["pnpm", "install", "--force"]
@@ -1814,6 +1920,7 @@ def _run_test_command(
     use_xdist: bool,
     mysql_version: str = "",
     postgres_version: str = "",
+    project_name: str | None = None,
 ):
     _verify_parallelism_parameters(
         excluded_parallel_test_types, run_db_tests_only, run_in_parallel, use_xdist
@@ -1848,6 +1955,7 @@ def _run_test_command(
         parallel_test_types_list=test_list,
         parallelism=parallelism,
         postgres_version=postgres_version,
+        project_name=project_name or get_default_project_name(),
         providers_constraints_location=providers_constraints_location,
         providers_skip_constraints=providers_skip_constraints,
         python=python,
@@ -1863,7 +1971,7 @@ def _run_test_command(
         run_tests=True,
         db_reset=db_reset if not skip_db_tests else False,
     )
-    rebuild_or_pull_ci_image_if_needed(command_params=shell_params)
+    build_ci_image_if_needed(command_params=shell_params)
     fix_ownership_using_docker()
     cleanup_python_generated_files()
     perform_environment_checks()

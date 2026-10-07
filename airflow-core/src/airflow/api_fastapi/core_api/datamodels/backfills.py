@@ -24,6 +24,7 @@ from pydantic import AliasPath, Field, NonNegativeInt
 
 from airflow.api_fastapi.core_api.base import BaseModel, StrictBaseModel
 from airflow.models.backfill import ReprocessBehavior
+from airflow.utils.state import DagRunState
 
 
 class BackfillPostBody(StrictBaseModel):
@@ -42,6 +43,14 @@ class BackfillPostBody(StrictBaseModel):
         "If not specified, falls back to the DAG-level ``rerun_with_latest_version`` parameter, "
         "then the ``[core] rerun_with_latest_version`` config option, "
         "and finally ``True`` (the historical default for backfills).",
+    )
+    drain_dag: bool = Field(
+        default=False,
+        description="Drain the Dag together with the backfill. Draining changes the whole Dag: unfinished "
+        "runs can start or resume except those held by paused backfills. No scheduled runs are created, "
+        "and the Dag pauses once all unfinished runs finish. Paused backfills must be resumed for draining "
+        "to complete. Requires the same permission as pausing the Dag. "
+        "Ignored by the dry-run endpoint.",
     )
 
 
@@ -66,6 +75,27 @@ class BackfillCollectionResponse(BaseModel):
     """Backfill Collection serializer for responses."""
 
     backfills: Iterable[BackfillResponse]
+    total_entries: int
+
+
+class BackfillDagRunResponse(BaseModel):
+    """Serializer for a single BackfillDagRun entry with joined DagRun state."""
+
+    id: NonNegativeInt
+    backfill_id: NonNegativeInt
+    dag_id: str = Field(validation_alias=AliasPath("backfill", "dag_id"))
+    dag_run_id: str | None = Field(default=None, validation_alias=AliasPath("dag_run", "run_id"))
+    logical_date: datetime | None
+    partition_key: str | None
+    sort_ordinal: int
+    exception_reason: str | None
+    dag_run_state: DagRunState | None = Field(default=None, validation_alias=AliasPath("dag_run", "state"))
+
+
+class BackfillDagRunCollectionResponse(BaseModel):
+    """BackfillDagRun Collection serializer for responses."""
+
+    backfill_dag_runs: list[BackfillDagRunResponse]
     total_entries: int
 
 

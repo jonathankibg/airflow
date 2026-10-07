@@ -15,12 +15,19 @@
       "favorite": "Ulubione",
       "unfavorite": "Nieulubione"
     },
+    "favoriteState": "Stan ulubionych",
+    "favoriteStatePlaceholder": "Wybierz stan ulubionych…",
+    "noTimetableTypesFound": "Nie znaleziono typów harmonogramu",
     "paused": {
       "active": "Aktywne",
       "all": "Wszystkie",
       "paused": "Wstrzymane"
     },
-    "runIdPatternFilter": "Szukaj Wykonań Dagów"
+    "pausedPlaceholder": "Wybierz stan wstrzymania…",
+    "pausedState": "Stan wstrzymania",
+    "requiresHitlAction": "Wymaga akcji HITL",
+    "runIdPatternFilter": "Szukaj Wykonań Dagów",
+    "timetableType": "Typ harmonogramu"
   },
   "ownerLink": "Link do właściciela {{owner}}",
   "runAndTaskActions": {
@@ -73,8 +80,32 @@
       "preventRunningTasks": "Zapobiegaj ponownemu uruchomieniu, jeśli zadanie jest uruchomione",
       "queueNew": "Kolejkuj nowe zadania",
       "runOnLatestVersion": "Uruchom w najnowszej wersji paczki Dagów",
+      "runOnLatestVersionForced": "Zawsze używa najnowszej — nie ma wcześniejszej wersji, do której można wrócić",
       "upstream": "Taski nadrzędne"
     }
+  },
+  "runStateCounts": {
+    "label": "Stany wykonań",
+    "loading": "Ładowanie liczby wykonań według stanu",
+    "tooltip": "{{state}}: {{formattedCount}} — kliknij, aby filtrować wykonania"
+  },
+  "schedulingActions": {
+    "cancelDrain": "Anuluj wygaszanie",
+    "drain": "Wygaś, potem wstrzymaj",
+    "drainPrompt": "Ten Dag ma trwające wykonania. Wygaszanie pozwoli im się zakończyć, zanim Dag zostanie wstrzymany; wstrzymanie teraz natychmiast zatrzyma planowanie, bez czekania na nie.",
+    "pauseNow": "Wstrzymaj teraz"
+  },
+  "schedulingBanner": {
+    "message": "Ten Dag jest wygaszany. Zostanie wstrzymany, gdy zakończą się jego trwające wykonania."
+  },
+  "schedulingState": {
+    "active": "Aktywne",
+    "draining": "Wygaszane",
+    "drainingBadgeTooltip": "Ten Dag zostanie wstrzymany, gdy zakończą się jego trwające wykonania.",
+    "drainingTooltip": "Wygaszanie {{dagDisplayName}} — wstrzymanie nastąpi po zakończeniu trwających wykonań. Kliknij, aby wznowić.",
+    "label": "Stan harmonogramu",
+    "paused": "Wstrzymane",
+    "placeholder": "Wybierz stan harmonogramu…"
   },
   "search": {
     "advanced": "Wyszukiwanie zaawansowane",
@@ -88,9 +119,9 @@
       "asc": "Sortuj według Nazwy Wyświetlanej (A-Z)",
       "desc": "Sortuj według Nazwy Wyświetlanej (Z-A)"
     },
-    "lastRunStartDate": {
-      "asc": "Sortuj według Daty Rozpoczęcia Ostatniego Wykonania (Najwcześniejsze-Najnowsze)",
-      "desc": "Sortuj według Daty Rozpoczęcia Ostatniego Wykonania (Najnowsze-Najwcześniejsze)"
+    "lastRunAfter": {
+      "asc": "Sortuj według Daty Ostatniego Wykonania (Najwcześniejsze-Najnowsze)",
+      "desc": "Sortuj według Daty Ostatniego Wykonania (Najnowsze-Najwcześniejsze)"
     },
     "lastRunState": {
       "asc": "Sortuj według Stanu Ostatniego Wykonania (A-Z)",

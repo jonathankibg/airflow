@@ -34,6 +34,7 @@ from airflow.api_fastapi.execution_api.security import _jwt_bearer
 from airflow.models.dagrun import DagRun
 from airflow.models.task_state_store import TaskStateStoreModel
 from airflow.utils.session import create_session
+from airflow.utils.state import TaskInstanceState
 
 if TYPE_CHECKING:
     from tests_common.pytest_plugin import CreateTaskInstance
@@ -74,6 +75,32 @@ class TestGetTaskState:
 
     def test_get_missing_ti_returns_404(self, client: TestClient):
         response = client.get(_api_url(uuid4(), "any_key"))
+
+        assert response.status_code == 404
+        assert "Task instance" in response.json()["detail"]["message"]
+
+    def test_get_key_with_slash(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        client.put(_api_url(ti.id, "spark/job_id"), json={"value": "spark_001"})
+
+        response = client.get(_api_url(ti.id, "spark/job_id"))
+
+        assert response.status_code == 200
+        assert response.json() == {"value": "spark_001"}
+
+    @pytest.mark.parametrize("method", ["get", "put", "delete"])
+    def test_archived_attempt_returns_404(
+        self, client: TestClient, create_task_instance: CreateTaskInstance, session, method
+    ):
+        ti = create_task_instance(state=TaskInstanceState.RUNNING)
+        session.commit()
+        old_id = ti.id
+        ti.prepare_db_for_next_try(session)
+        session.commit()
+        client.headers["Airflow-API-Version"] = "2026-06-30"
+        kwargs = {"json": {"value": "stale"}} if method == "put" else {}
+
+        response = getattr(client, method)(_api_url(old_id, "job_id"), **kwargs)
 
         assert response.status_code == 404
         assert "Task instance" in response.json()["detail"]["message"]
@@ -203,6 +230,14 @@ class TestPutTaskState:
 
         assert response.status_code == 404
 
+    def test_put_key_with_slash(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+
+        response = client.put(_api_url(ti.id, "spark/job_id"), json={"value": "spark_001"})
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "spark/job_id")).json() == {"value": "spark_001"}
+
 
 class TestDeleteTaskState:
     def test_delete_removes_key(self, client: TestClient, create_task_instance: CreateTaskInstance):
@@ -230,6 +265,15 @@ class TestDeleteTaskState:
 
         assert client.get(_api_url(ti.id, "job_id")).status_code == 404
         assert client.get(_api_url(ti.id, "checkpoint")).json() == {"value": "b"}
+
+    def test_delete_key_with_slash(self, client: TestClient, create_task_instance: CreateTaskInstance):
+        ti = create_task_instance()
+        client.put(_api_url(ti.id, "spark/job_id"), json={"value": "spark_001"})
+
+        response = client.delete(_api_url(ti.id, "spark/job_id"))
+
+        assert response.status_code == 204
+        assert client.get(_api_url(ti.id, "spark/job_id")).status_code == 404
 
 
 class TestClearTaskState:

@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from airflow import settings
 from airflow._shared.timezones import timezone
 from airflow.cli.simple_table import AirflowConsole
-from airflow.cli.utils import fetch_dag_run_from_run_id_or_logical_date_string
+from airflow.cli.utils import deprecated_for_airflowctl, fetch_dag_run_from_run_id_or_logical_date_string
 from airflow.exceptions import AirflowConfigException, DagRunNotFound, NotMapped, TaskInstanceNotFound
 from airflow.models import TaskInstance
 from airflow.models.dag_version import DagVersion
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.orm.session import Session
 
+    from airflow.dag_processing.dagbag import BaggedDAG
     from airflow.sdk import Context
     from airflow.sdk.types import Operator as SdkOperator
     from airflow.serialization.definitions.mappedoperator import Operator
@@ -262,6 +263,7 @@ class TaskCommandMarker:
     """Marker for listener hooks, to properly detect from which component they are called."""
 
 
+@deprecated_for_airflowctl("airflowctl tasks failed-deps")
 @cli_utils.action_cli(check_db=False)
 @providers_configuration_loaded
 def task_failed_deps(args) -> None:
@@ -290,6 +292,7 @@ def task_failed_deps(args) -> None:
         print("Task instance dependencies are all met.")
 
 
+@deprecated_for_airflowctl("airflowctl tasks state")
 @cli_utils.action_cli(check_db=False)
 @suppress_logs_and_warning
 @providers_configuration_loaded
@@ -307,12 +310,13 @@ def task_state(args) -> None:
     print(ti.state)
 
 
+@deprecated_for_airflowctl("airflowctl tasks list")
 @cli_utils.action_cli(check_db=False)
 @suppress_logs_and_warning
 @providers_configuration_loaded
-def task_list(args, dag: DAG | None = None) -> None:
+def task_list(args, dag: BaggedDAG | None = None) -> None:
     """List the tasks within a DAG at the command line."""
-    dag = dag or get_bagged_dag(args.bundle_name, args.dag_id)
+    dag = dag or get_bagged_dag(args.bundle_name, args.dag_id, allow_lang_sdk_dag=True)
     tasks = sorted(t.task_id for t in dag.tasks)
     print("\n".join(tasks))
 
@@ -354,6 +358,7 @@ def _guess_debugger() -> _SupportedDebugger:
     raise exc
 
 
+@deprecated_for_airflowctl("airflowctl tasks states-for-dag-run")
 @cli_utils.action_cli(check_db=False)
 @suppress_logs_and_warning
 @providers_configuration_loaded
@@ -413,7 +418,7 @@ def task_test(args, dag: DAG | None = None) -> None:
     env_vars = {"AIRFLOW_TEST_MODE": "True"}
     if args.env_vars:
         env_vars.update(args.env_vars)
-        os.environ.update(env_vars)
+    os.environ.update(env_vars)
 
     if dag:
         sdk_dag = dag
@@ -492,6 +497,7 @@ def task_render(args, dag: DAG | None = None) -> None:
         )
 
 
+@deprecated_for_airflowctl("airflowctl tasks clear")
 @cli_utils.action_cli(check_db=False)
 @providers_configuration_loaded
 def task_clear(args) -> None:

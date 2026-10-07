@@ -42,6 +42,7 @@
   },
   "deadlineAlerts": {
     "completionRule": "Musi zakończyć się w ciągu {{interval}} od momentu: {{reference}}",
+    "completionRuleDynamic": "Musi zakończyć się w zmiennym interwale liczonym od momentu: {{reference}}",
     "count_few": "{{count}} terminy",
     "count_many": "{{count}} terminów",
     "count_one": "{{count}} termin",
@@ -97,10 +98,6 @@
     "critical": "CRITICAL",
     "debug": "DEBUG",
     "error": "ERROR",
-    "fullscreen": {
-      "button": "Pełny ekran",
-      "tooltip": "Naciśnij {{hotkey}}, aby przejść do pełnego ekranu"
-    },
     "info": "INFO",
     "noTryNumber": "Brak numeru próby",
     "search": {
@@ -111,11 +108,6 @@
     "settings": "Ustawienia logowania",
     "viewInExternal": "Zobacz logi w {{name}} (próba {{attempt}})",
     "warning": "WARNING"
-  },
-  "navigation": {
-    "navigation": "Przewiń: {{arrow}}",
-    "openGraphFilters": "Filtry zadań: Ctrl+Shift+F",
-    "toggleGroup": "Przełącz grupę: Space"
   },
   "notFound": {
     "back": "Wróć",
@@ -166,13 +158,7 @@
       "label": "Liczba wykonań Daga"
     },
     "dependencies": {
-      "label": "Zależności",
-      "options": {
-        "allDagDependencies": "Wszystkie zależności Daga",
-        "externalConditions": "Warunki zewnętrzne",
-        "onlyTasks": "Tylko zadania"
-      },
-      "placeholder": "Zależności"
+      "allDagDependencies": "Wszystkie zależności Daga"
     },
     "graphDirection": {
       "label": "Kierunek grafu"
@@ -246,9 +232,8 @@
     "renderedTemplates": "Wyrenderowane szablony",
     "requiredActions": "Wymagane akcje",
     "runs": "Wykonania",
-    "storage": "Magazyn",
     "taskInstances": "Instancje zadań",
-    "taskStore": "Magazyn zadań",
+    "taskStateStore": "Magazyn stanu zadania",
     "tasks": "Zadania",
     "xcom": "XCom"
   },
@@ -256,17 +241,21 @@
     "collapseAll": "Zwiń wszystkie grupy zadań",
     "expandAll": "Rozwiń wszystkie grupy zadań"
   },
-  "taskStore": {
-    "add": "Dodaj magazyn zadań",
+  "taskStateStore": {
+    "add": "Dodaj wpis magazynu stanu zadania",
     "clearAll": {
-      "resource": "cały magazyn zadań",
-      "title": "Wyczyść cały magazyn zadań",
-      "warning": "Cały magazyn zadań zostanie wyczyszczony. Zadania, które używają tego magazynu do śledzenia zewnętrznej pracy, nie będą mogły jej wznowić bez ponownego uruchomienia."
+      "resource": "całego magazynu stanu zadania",
+      "title": "Wyczyść cały magazyn stanu zadania",
+      "warning": "Cały magazyn stanu zadania zostanie wyczyszczony. Zadania, które używają go do śledzenia pracy zewnętrznej, nie będą mogły jej wznowić bez uruchomienia od nowa."
     },
-    "delete": "Usuń magazyn zadań",
-    "deleteWarning": "Zadanie utraci te zapisane dane. Jeśli zadanie używa tego klucza do śledzenia zewnętrznej pracy (np. identyfikatora zewnętrznego zadania), nie będzie mogło jej wznowić.",
-    "edit": "Edytuj magazyn zadań",
-    "emptyStore": "Magazyn zadań przechowuje wartości, które są zachowywane między ponownymi próbami. Procesy robocze mogą zapisywać do magazynu zadań za pomocą Task SDK.",
+    "delete": "Usuń wpis magazynu stanu zadania",
+    "deleteWarning": "Zadanie utraci te zachowane dane. Jeśli używa tego klucza do śledzenia pracy zewnętrznej (np. zewnętrznego ID zadania), nie będzie mogło jej wznowić.",
+    "edit": "Edytuj wpis magazynu stanu zadania",
+    "emptyStore": "Magazyn stanu zadania przechowuje wartości zachowywane pomiędzy ponownymi próbami. Workery mogą zapisywać do magazynu stanu zadania przez Task SDK.",
+    "entry_few": "Wpisy",
+    "entry_many": "Wpisów",
+    "entry_one": "Wpis",
+    "entry_other": "Wpisy",
     "expiresAt": {
       "column": "Wygasa o",
       "custom": "Niestandardowy",
@@ -274,6 +263,6 @@
       "label": "Wygaśnięcie",
       "never": "Nigdy"
     },
-    "title": "Magazyn zadań"
+    "title": "Magazyn stanu zadania"
   }
 }

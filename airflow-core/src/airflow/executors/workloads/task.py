@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import Field
 
 from airflow.api_fastapi.execution_api.datamodels.taskinstance import TaskInstance
-from airflow.executors.workloads.base import BaseDagBundleWorkload, BundleInfo
+from airflow.executors.workloads.base import BaseDagBundleWorkload, BundleInfo, WorkloadType
 from airflow.utils.state import TaskInstanceState
 
 if TYPE_CHECKING:
@@ -48,7 +48,6 @@ class TaskInstanceDTO(TaskInstance):
     external_executor_id: str | None = Field(default=None, exclude=True)
     executor_config: dict | None = Field(default=None, exclude=True)
 
-    # TODO: Task-SDK: Can we replace TaskInstanceKey with just the uuid across the codebase?
     @property
     def key(self) -> TaskInstanceKey:
         from airflow.models.taskinstancekey import TaskInstanceKey
@@ -68,12 +67,17 @@ class ExecuteTask(BaseDagBundleWorkload):
     ti: TaskInstanceDTO
     sentry_integration: str = ""
 
-    type: Literal["ExecuteTask"] = Field(init=False, default="ExecuteTask")
+    type: Literal[WorkloadType.EXECUTE_TASK] = Field(init=False, default=WorkloadType.EXECUTE_TASK)
 
     @property
     def key(self) -> TaskInstanceKey:
-        """Return the TaskInstanceKey for this workload."""
+        """Return the coordinate key used by existing executor providers."""
         return self.ti.key
+
+    @property
+    def sort_key(self) -> int:
+        """Return the negated task priority weight so the ascending sort dispatches the highest ``priority_weight`` first."""
+        return -self.ti.priority_weight
 
     @property
     def display_name(self) -> str:
@@ -102,13 +106,16 @@ class ExecuteTask(BaseDagBundleWorkload):
 
         ser_ti = TaskInstanceDTO.model_validate(ti, from_attributes=True)
         if not bundle_info:
-            version_data = None
-            if ti.dag_version is not None and ti.dag_run.bundle_version is not None:
-                version_data = ti.dag_version.version_data
+            from airflow.models.dag_version import _resolve_version_data
+
             bundle_info = BundleInfo(
                 name=ti.dag_model.bundle_name,
                 version=ti.dag_run.bundle_version,
-                version_data=version_data,
+                # Source version_data from the run's pinned version (matching ``version`` above),
+                # not the TI's dag_version. A mid-run DAG re-parse can bump the TI's dag_version
+                # to a newer version while the run stays pinned; sourcing from created_dag_version
+                # keeps the shipped hash and manifest consistent so versioned bundles stay reproducible.
+                version_data=_resolve_version_data(ti.dag_run.created_dag_version, ti.dag_run.bundle_version),
             )
         fname = log_filename_template_renderer()(ti=ti)
 

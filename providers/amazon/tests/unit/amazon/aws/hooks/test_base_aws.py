@@ -21,7 +21,7 @@ import json
 import os
 from base64 import b64encode
 from contextlib import nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock, PropertyMock, mock_open
@@ -321,7 +321,7 @@ class TestSessionFactory:
                     "access_key": "mock-AccessKeyId",
                     "secret_key": "mock-SecretAccessKey",
                     "token": "mock-SessionToken",
-                    "expiry_time": datetime.now(timezone.utc).isoformat(),
+                    "expiry_time": datetime.now(UTC).isoformat(),
                 }
 
             mock_refresh.side_effect = side_effect
@@ -467,6 +467,12 @@ class TestAwsBaseHook:
             mock_supervisor_comms.send.return_value = ConnectionResult(
                 conn_id="aws_default",
                 conn_type="aws",
+                host=None,
+                schema=None,
+                login=None,
+                password=None,
+                port=None,
+                extra=None,
             )
         with mock.patch.dict(os.environ, env_var, clear=True):
             dag_run_key = self.fetch_tags()["DagRunKey"]
@@ -833,7 +839,7 @@ class TestAwsBaseHook:
         expire_on_calls = []
 
         def mock_refresh_credentials():
-            expiry_datetime = datetime.now(timezone.utc)
+            expiry_datetime = datetime.now(UTC)
             expire_on_call = expire_on_calls.pop()
             if expire_on_call:
                 expiry_datetime -= timedelta(minutes=1000)
@@ -1191,6 +1197,8 @@ def test_raise_no_creds_default_credentials_strategy(tmp_path_factory, monkeypat
     for env_key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"):
         # Delete aws credentials environment variables
         monkeypatch.delenv(env_key, raising=False)
+    # On an EC2 host the credential chain would otherwise reach the instance role via IMDS
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
     hook = AwsBaseHook(aws_conn_id=None, client_type="sts")
     with pytest.raises(NoCredentialsError) as credential_error:

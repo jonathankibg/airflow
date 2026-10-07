@@ -16,12 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { useEffect, useState } from "react";
+
 import { Button, Box, Spacer, HStack, Field, Stack, Text, VStack } from "@chakra-ui/react";
 import dayjs from "dayjs";
-import { useEffect, useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { FiPlay } from "react-icons/fi";
+
+import { RadioCardItem, RadioCardRoot } from "src/system-components";
 
 import { useDagParams } from "src/queries/useDagParams";
 import { useParamStore } from "src/queries/useParamStore";
@@ -31,19 +34,19 @@ import { DEFAULT_DATETIME_FORMAT } from "src/utils/datetimeUtils";
 import ConfigForm from "../ConfigForm";
 import { DateTimeInput } from "../DateTimeInput";
 import { ErrorAlert, type ExpandedApiError } from "../ErrorAlert";
-import { Checkbox } from "../ui/Checkbox";
-import { RadioCardItem, RadioCardRoot } from "../ui/RadioCard";
+import PausedDagOptions from "./PausedDagOptions";
 import TriggerDAGAdvancedOptions from "./TriggerDAGAdvancedOptions";
-import { dataIntervalModeOptions, type DagRunTriggerParams } from "./types";
+import { dataIntervalModeOptions, type DagRunTriggerParams, type PausedDagAction } from "./types";
 
 type TriggerDAGFormProps = {
-  readonly dagDisplayName: string;
   readonly dagId: string;
+  readonly disabled?: boolean;
   readonly error?: unknown;
   readonly hasSchedule: boolean;
   readonly isPartitioned: boolean;
   readonly isPaused: boolean;
   readonly isPending?: boolean;
+  readonly onPausedDagActionChange?: () => void;
   readonly onSubmitTrigger?: (params: DagRunTriggerParams) => void;
   readonly open: boolean;
   readonly prefillConfig?:
@@ -56,13 +59,14 @@ type TriggerDAGFormProps = {
 };
 
 const TriggerDAGForm = ({
-  dagDisplayName,
   dagId,
+  disabled = false,
   error,
   hasSchedule,
   isPartitioned,
   isPaused,
   isPending = false,
+  onPausedDagActionChange,
   onSubmitTrigger,
   open,
   prefillConfig,
@@ -72,7 +76,7 @@ const TriggerDAGForm = ({
   const [formError, setFormError] = useState(false);
   const initialParamsDict = useDagParams(dagId, open);
   const { conf, initialParamDict, setConf, setInitialParamDict } = useParamStore();
-  const [unpause, setUnpause] = useState(true);
+  const [pausedDagAction, setPausedDagAction] = useState<PausedDagAction>("unpause");
   const [hasAppliedPrefill, setHasAppliedPrefill] = useState(false);
   const { mutate: togglePause } = useTogglePause({ dagId });
 
@@ -107,10 +111,14 @@ const TriggerDAGForm = ({
         note: "",
         partitionKey: undefined,
       });
-      // Also update the param store to keep it in sync.
-      // Wait until we have the initial params so section ordering stays consistent.
-      if (confString && Object.keys(initialParamsDict.paramsDict).length > 0) {
-        if (Object.keys(initialParamDict).length === 0) {
+      // Also update the param store to keep it in sync. Seed the initial params (for stable
+      // section ordering) only once they are available, but always push the conf so a run's
+      // configuration propagates even for Dags with no declared params or before params load.
+      if (confString) {
+        if (
+          Object.keys(initialParamsDict.paramsDict).length > 0 &&
+          Object.keys(initialParamDict).length === 0
+        ) {
           setInitialParamDict(initialParamsDict.paramsDict);
         }
         setConf(confString);
@@ -147,10 +155,13 @@ const TriggerDAGForm = ({
     dataIntervalMode === "manual" &&
     (noDataInterval || dayjs(dataIntervalStart).isAfter(dayjs(dataIntervalEnd)));
   const onSubmit = (data: DagRunTriggerParams) => {
-    if (unpause && isPaused) {
+    if (disabled) {
+      return;
+    }
+    if (pausedDagAction === "unpause" && isPaused) {
       togglePause({ dagId, requestBody: { is_paused: false } });
     }
-    onSubmitTrigger?.(data);
+    onSubmitTrigger?.({ ...data, drainDag: isPaused && pausedDagAction === "drain" });
   };
 
   return (
@@ -231,9 +242,14 @@ const TriggerDAGForm = ({
         )}
         {isPaused ? (
           <>
-            <Checkbox checked={unpause} onChange={() => setUnpause(!unpause)} wordBreak="break-all">
-              {translate("components:triggerDag.unpause", { dagDisplayName })}
-            </Checkbox>
+            <PausedDagOptions
+              dagId={dagId}
+              onChange={(action) => {
+                setPausedDagAction(action);
+                onPausedDagActionChange?.();
+              }}
+              value={pausedDagAction}
+            />
             <Spacer />
           </>
         ) : undefined}
@@ -244,7 +260,7 @@ const TriggerDAGForm = ({
           setErrors={setErrors}
           setFormError={setFormError}
         >
-          <TriggerDAGAdvancedOptions control={control} />
+          <TriggerDAGAdvancedOptions control={control} isPartitioned={isPartitioned} />
         </ConfigForm>
       </VStack>
       <Box as="footer" display="flex" justifyContent="flex-end" mt={4}>
@@ -253,6 +269,7 @@ const TriggerDAGForm = ({
           <Button
             data-testid="trigger-dag-submit"
             disabled={
+              disabled ||
               Boolean(errors.conf) ||
               Boolean(errors.date) ||
               formError ||

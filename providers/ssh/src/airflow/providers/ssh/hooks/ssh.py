@@ -20,11 +20,11 @@
 from __future__ import annotations
 
 import os
+import selectors
 from base64 import decodebytes
 from collections.abc import Sequence
 from functools import cached_property
 from io import StringIO
-from select import select
 from typing import Any
 
 import paramiko
@@ -49,6 +49,16 @@ except ImportError:
 
 
 CMD_TIMEOUT = 10
+
+_HostKeyConstructor = type[paramiko.RSAKey] | type[paramiko.ECDSAKey] | type[paramiko.Ed25519Key]
+_SUPPORTED_HOST_KEY_TYPES = (
+    "ssh-rsa",
+    "ssh-ecdsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "ssh-ed25519",
+)
 
 
 class SSHHook(BaseHook):
@@ -87,19 +97,21 @@ class SSHHook(BaseHook):
         once and some connections are transiently refused (e.g. ``sshd`` ``MaxStartups`` throttling).
     """
 
-    # List of classes to try loading private keys as, ordered (roughly) by most common to least common
+    # List of classes to try loading private keys as, ordered (roughly) by most common to least common.
+    # DSA/DSS keys are not supported (removed in paramiko 4.0).
     _pkey_loaders: Sequence[type[paramiko.PKey]] = (
         paramiko.RSAKey,
         paramiko.ECDSAKey,
         paramiko.Ed25519Key,
-        paramiko.DSSKey,
     )
 
-    _host_key_mappings = {
-        "rsa": paramiko.RSAKey,
-        "dss": paramiko.DSSKey,
-        "ecdsa": paramiko.ECDSAKey,
-        "ed25519": paramiko.Ed25519Key,
+    _host_key_mappings: dict[str, _HostKeyConstructor] = {
+        "ssh-rsa": paramiko.RSAKey,
+        "ssh-ecdsa": paramiko.ECDSAKey,
+        "ecdsa-sha2-nistp256": paramiko.ECDSAKey,
+        "ecdsa-sha2-nistp384": paramiko.ECDSAKey,
+        "ecdsa-sha2-nistp521": paramiko.ECDSAKey,
+        "ssh-ed25519": paramiko.Ed25519Key,
     }
 
     conn_name_attr = "ssh_conn_id"
@@ -227,11 +239,25 @@ class SSHHook(BaseHook):
                     self.ciphers = extra_options.get("ciphers")
 
                 if host_key is not None:
-                    if host_key.startswith("ssh-"):
-                        key_type, host_key = host_key.split(None)[:2]
-                        key_constructor = self._host_key_mappings[key_type[4:]]
-                    else:
-                        key_constructor = paramiko.RSAKey
+                    host_key = host_key.strip()
+                    host_key_parts = host_key.split()
+                    key_constructor: _HostKeyConstructor = paramiko.RSAKey
+                    if len(host_key_parts) >= 2:
+                        key_type, host_key = host_key_parts[:2]
+                        if key_type == "ssh-dss":
+                            raise ValueError(
+                                "DSA/DSS host keys are not supported. Paramiko 4.0 removed DSS support; "
+                                "use an RSA, ECDSA, or Ed25519 host key and update the connection `host_key`."
+                            )
+                        key_constructor_for_type = self._host_key_mappings.get(key_type)
+                        if key_constructor_for_type is None:
+                            raise ValueError(
+                                f"Unsupported SSH host key algorithm {key_type!r}. "
+                                f"Supported types are: {', '.join(_SUPPORTED_HOST_KEY_TYPES)}."
+                            )
+                        key_constructor = key_constructor_for_type
+                    elif host_key in self._host_key_mappings or host_key == "ssh-dss":
+                        raise ValueError(f"SSH host key {host_key!r} is missing key data.")
                     decoded_host_key = decodebytes(host_key.encode("utf-8"))
                     self.host_key = key_constructor(data=decoded_host_key)
                     self.no_host_key_check = False
@@ -418,14 +444,17 @@ class SSHHook(BaseHook):
                 key = pkey_class.from_private_key(StringIO(private_key), password=passphrase)
                 # Test it actually works. If Paramiko loads an openssh generated key, sometimes it will
                 # happily load it as the wrong type, only to fail when actually used.
-                key.sign_ssh_data(b"")
+                if key.get_name() == "ssh-rsa":
+                    key.sign_ssh_data(b"", algorithm="rsa-sha2-512")
+                else:
+                    key.sign_ssh_data(b"")
                 return key
             except (paramiko.ssh_exception.SSHException, ValueError):
                 continue
         raise AirflowException(
-            "Private key provided cannot be read by paramiko."
-            "Ensure key provided is valid for one of the following"
-            "key formats: RSA, DSS, ECDSA, or Ed25519"
+            "Private key provided cannot be read by paramiko. "
+            "Ensure key provided is valid for one of the following "
+            "key formats: RSA, ECDSA, or Ed25519."
         )
 
     def exec_ssh_client_command(
@@ -472,36 +501,42 @@ class SSHHook(BaseHook):
 
         timedout = False
 
-        # read from both stdout and stderr
-        while not channel.closed or channel.recv_ready() or channel.recv_stderr_ready():
-            readq, _, _ = select([channel], [], [], cmd_timeout)
-            if cmd_timeout is not None:
-                timedout = not readq
-            for recv in readq:
-                if recv.recv_ready():
-                    output = stdout.channel.recv(len(recv.in_buffer))
-                    agg_stdout += output
-                    for line in output.decode("utf-8", "replace").strip("\n").splitlines():
-                        self.log.info(line)
-                if recv.recv_stderr_ready():
-                    output = stderr.channel.recv_stderr(len(recv.in_stderr_buffer))
-                    agg_stderr += output
-                    for line in output.decode("utf-8", "replace").strip("\n").splitlines():
-                        self.log.warning(line)
-            if (
-                stdout.channel.exit_status_ready()
-                and not stderr.channel.recv_stderr_ready()
-                and not stdout.channel.recv_ready()
-            ) or timedout:
-                stdout.channel.shutdown_read()
-                try:
-                    stdout.channel.close()
-                except Exception:
-                    # there is a race that when shutdown_read has been called and when
-                    # you try to close the connection, the socket is already closed
-                    # We should ignore such errors (but we should log them with warning)
-                    self.log.warning("Ignoring exception on close", exc_info=True)
-                break
+        # select.select() rejects descriptors numbered FD_SETSIZE (1024) or above, which a task
+        # process can reach; DefaultSelector uses epoll/kqueue/poll where available.
+        with selectors.DefaultSelector() as selector:
+            selector.register(channel, selectors.EVENT_READ, data=channel)
+
+            # read from both stdout and stderr
+            while not channel.closed or channel.recv_ready() or channel.recv_stderr_ready():
+                events = selector.select(cmd_timeout)
+                if cmd_timeout is not None:
+                    timedout = not events
+                for key, _ in events:
+                    recv = key.data
+                    if recv.recv_ready():
+                        output = stdout.channel.recv(len(recv.in_buffer))
+                        agg_stdout += output
+                        for line in output.decode("utf-8", "replace").strip("\n").splitlines():
+                            self.log.info(line)
+                    if recv.recv_stderr_ready():
+                        output = stderr.channel.recv_stderr(len(recv.in_stderr_buffer))
+                        agg_stderr += output
+                        for line in output.decode("utf-8", "replace").strip("\n").splitlines():
+                            self.log.warning(line)
+                if (
+                    stdout.channel.exit_status_ready()
+                    and not stderr.channel.recv_stderr_ready()
+                    and not stdout.channel.recv_ready()
+                ) or timedout:
+                    stdout.channel.shutdown_read()
+                    try:
+                        stdout.channel.close()
+                    except Exception:
+                        # there is a race that when shutdown_read has been called and when
+                        # you try to close the connection, the socket is already closed
+                        # We should ignore such errors (but we should log them with warning)
+                        self.log.warning("Ignoring exception on close", exc_info=True)
+                    break
 
         stdout.close()
         stderr.close()
@@ -599,6 +634,15 @@ class SSHHookAsync(BaseHook):
             self.log.warning("No Host Key Verification. This won't protect against Man-In-The-Middle attacks")
             self.known_hosts = "none"
         elif host_key is not None:
+            host_key = host_key.strip()
+            host_key_parts = host_key.split()
+            if host_key_parts and host_key_parts[0] == "ssh-dss":
+                raise ValueError(
+                    "DSA/DSS host keys are not supported. Paramiko 4.0 removed DSS support; "
+                    "use an RSA, ECDSA, or Ed25519 host key and update the connection `host_key`."
+                )
+            if len(host_key_parts) >= 2:
+                host_key = " ".join(host_key_parts[:2])
             self.known_hosts = f"{conn.host} {host_key}".encode()
 
     async def _get_conn(self):

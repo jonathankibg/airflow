@@ -21,13 +21,15 @@
 
 This example shows the coordinator-mode shape for TypeScript task handlers:
 
-- `dags/typescript_example.py` declares the Airflow Dag and stub tasks.
-- `src/main.ts` registers TypeScript handlers for the same Dag/task IDs and
-  starts the coordinator runtime.
-- `dist/bundle.mjs` is the generated Node.js bundle that Airflow launches.
+- `dags/typescript_example.py` and `dags/typescript_taskflow_example.py` declare two Airflow Dags and their stub tasks.
+- `src/main.ts` and `src/taskflow.ts` register a `TaskHandler` per stub task and start the coordinator runtime.
+  One bundle provides for both Dags, and both declare a task called `build_message`.
+  A handler binds the `(dag_id, task_id)` pair, so the two are different tasks with different bodies.
+- `dist/bundle.min.mjs` is the generated Node.js bundle that Airflow launches.
 
-The TypeScript SDK does not include a packer yet, so this example builds the
-bundle with `esbuild` and writes the Airflow metadata file manually.
+The build uses the SDK's `airflow-ts-pack` tool, which bundles the entrypoint
+with esbuild and embeds the Airflow metadata generated from the bundle's
+registered tasks, producing a single deployable file.
 
 ## Build
 
@@ -39,7 +41,7 @@ pnpm install
 pnpm run build
 ```
 
-Build the example bundle:
+Build the example bundle and its metadata:
 
 ```bash
 cd ts-sdk/example
@@ -47,43 +49,39 @@ pnpm install
 pnpm run build
 ```
 
-Create the metadata file next to the generated bundle:
-
-```bash
-node --input-type=module > dist/airflow-metadata.yaml <<'EOF'
-import { SUPERVISOR_API_VERSION } from "@apache-airflow/ts-sdk";
-
-console.log(`sdk:
-  supervisor_schema_version: "${SUPERVISOR_API_VERSION}"`);
-EOF
-```
-
 The coordinator expects this layout:
 
 ```text
 ts-sdk/example/dist/
-  bundle.mjs
-  airflow-metadata.yaml
+  bundle.min.mjs
 ```
 
 ## Airflow Configuration
 
-Configure Airflow to route the `typescript` queue to the Node coordinator and
-point it at the example bundle directory:
+Register the example bundle directory as a Dag bundle, and configure Airflow to
+route the `typescript` queue to the Node coordinator that reads it:
 
 ```bash
+export AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST='[
+  {"name": "dags-folder", "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle", "kwargs": {}},
+  {
+    "name": "ts-task-handlers",
+    "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+    "kwargs": {"path": "/absolute/path/to/airflow/ts-sdk/example/dist"}
+  }
+]'
 export AIRFLOW__SDK__COORDINATORS='{
-  "node": {
+  "ts": {
     "classpath": "airflow.sdk.coordinators.node.NodeCoordinator",
-    "kwargs": {"bundles_root": ["/absolute/path/to/airflow/ts-sdk/example/dist"]}
+    "kwargs": {"task_handler_bundle_name": "ts-task-handlers"}
   }
 }'
-export AIRFLOW__SDK__QUEUE_TO_COORDINATOR='{"typescript": "node"}'
+export AIRFLOW__SDK__QUEUE_TO_COORDINATOR='{"typescript": "ts"}'
 ```
 
-Copy `dags/typescript_example.py` into your Airflow Dags folder.
+Copy both files in `dags/` into your Airflow Dags folder.
 
-The example also uses one Variable and one Connection:
+The example also reads one Variable and one Connection:
 
 ```bash
 airflow variables set typescript_example_greeting "hello from Airflow"
@@ -94,8 +92,12 @@ airflow connections add typescript_example_http \
   --conn-password pass
 ```
 
+`write_and_delete_variable` writes the Variables it needs: it records the run id in
+`typescript_example_last_run` and deletes the `typescript_example_scratch` Variable it has just written.
+
 Then start Airflow and trigger the Dag:
 
 ```bash
 airflow dags trigger typescript_example
+airflow dags trigger typescript_taskflow_example
 ```

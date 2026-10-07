@@ -38,6 +38,7 @@ from fastapi.routing import APIRoute
 from opentelemetry import context as otel_context, propagate as otel_propagate
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from airflow import settings
 from airflow.api_fastapi.auth.tokens import (
     JWTGenerator,
     JWTValidator,
@@ -148,10 +149,10 @@ class JWTReissueMiddleware(BaseHTTPMiddleware):
                     validator: JWTValidator = await services.aget(JWTValidator)
                     claims = await validator.avalidated_claims(token, {})
 
-                    # Workload tokens are long-lived and meant to survive queue
-                    # wait times so avoid refreshing them. If avalidated_claims
-                    # raises for a workload token, the outer except handles it.
-                    if claims.get("scope") == "workload":
+                    # Workload and callback tokens are long-lived and meant to survive
+                    # queue wait times so avoid refreshing them. If avalidated_claims
+                    # raises for such a token, the outer except handles it.
+                    if claims.get("scope") in ("workload", "callback"):
                         return response
 
                     now = int(time.time())
@@ -287,6 +288,7 @@ def _inject_trace_context_dep(routes, mode: str) -> None:
 
 def create_task_execution_api_app(lifespan: svcs.fastapi.lifespan = lifespan) -> FastAPI:
     """Create FastAPI app for task execution API."""
+    from airflow.api_fastapi.common.exceptions import init_error_handlers
     from airflow.api_fastapi.execution_api.routes import execution_api_router
     from airflow.api_fastapi.execution_api.versions import bundle
     from airflow.configuration import conf
@@ -314,6 +316,7 @@ def create_task_execution_api_app(lifespan: svcs.fastapi.lifespan = lifespan) ->
     _inject_trace_context_dep(execution_api_router.routes, mode)
 
     app.generate_and_include_versioned_routers(execution_api_router)
+    init_error_handlers(app)
 
     # As we are mounted as a sub app, we don't get any logs for unhandled exceptions without this!
     @app.exception_handler(Exception)
@@ -389,7 +392,7 @@ class InProcessExecutionAPI:
             from airflow.api_fastapi.execution_api.routes.connections import has_connection_access
             from airflow.api_fastapi.execution_api.routes.variables import has_variable_access
             from airflow.api_fastapi.execution_api.routes.xcoms import has_xcom_access
-            from airflow.api_fastapi.execution_api.security import _jwt_bearer
+            from airflow.api_fastapi.execution_api.security import _IN_PROCESS_NON_TI_CALLER, _jwt_bearer
 
             # Give this app its own lifespan + services registry so that stubbing services
             # (e.g. JWTValidator) doesn't affect the module-level ``lifespan.registry``.
@@ -408,7 +411,14 @@ class InProcessExecutionAPI:
                 from uuid import UUID
 
                 ti_id = UUID(
-                    request.path_params.get("task_instance_id", "00000000-0000-0000-0000-000000000000")
+                    request.path_params.get("task_instance_id")
+                    or request.headers.get("X-Airflow-In-Process-Attempt-Id")
+                    or "00000000-0000-0000-0000-000000000000"
+                )
+                # Watchers and other trusted in-process callers may have no task identity.
+                request.scope[_IN_PROCESS_NON_TI_CALLER] = (
+                    "task_instance_id" not in request.path_params
+                    and "X-Airflow-In-Process-Attempt-Id" not in request.headers
                 )
                 claims = TIClaims(scope="execution")
                 return TIToken(id=ti_id, claims=claims)
@@ -435,6 +445,7 @@ class InProcessExecutionAPI:
 
         # https://github.com/abersheeran/a2wsgi/discussions/64
         async def start_lifespan(cm: AsyncExitStack, app: FastAPI):
+            cm.push_async_callback(settings.dispose_async_engine)
             await cm.enter_async_context(app.router.lifespan_context(app))
 
         cm = AsyncExitStack()

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from io import StringIO
 from pathlib import Path
 from types import ModuleType
@@ -377,6 +378,33 @@ class TestSparkSubmitHook:
             universal_newlines=True,
             bufsize=-1,
         )
+
+    @pytest.mark.db_test
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.subprocess.Popen")
+    def test_submit_failure_includes_captured_log_tail(self, mock_popen, sdk_connection_not_found):
+        mock_popen.return_value.stdout = StringIO(
+            'Exception in thread "main" org.apache.spark.SparkException: bad jar\nsome other line'
+        )
+        mock_popen.return_value.stderr = StringIO("")
+        mock_popen.return_value.wait.return_value = 1
+
+        hook = SparkSubmitHook(conn_id="")
+
+        with pytest.raises(AirflowException, match="Last spark-submit output:") as exc_info:
+            hook.submit()
+        assert 'Exception in thread "main" org.apache.spark.SparkException: bad jar' in str(exc_info.value)
+
+    @pytest.mark.db_test
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.subprocess.Popen")
+    def test_submit_no_driver_id_includes_captured_log_tail(self, mock_popen, sdk_connection_not_found):
+        mock_popen.return_value.stdout = StringIO("some unrelated spark-submit output")
+        mock_popen.return_value.stderr = StringIO("")
+        mock_popen.return_value.wait.return_value = 0
+
+        hook = SparkSubmitHook(conn_id="spark_standalone_cluster")
+        with pytest.raises(AirflowException, match="No driver id is known") as exc_info:
+            hook.submit()
+        assert "Last spark-submit output:\nsome unrelated spark-submit output" in str(exc_info.value)
 
     @pytest.mark.db_test
     def test_resolve_should_track_driver_status(self, sdk_connection_not_found):
@@ -986,6 +1014,54 @@ class TestSparkSubmitHook:
 
         assert hook._driver_id == "driver-20171128111415-0001"
 
+    def test_process_spark_submit_log_captures_from_exception_marker_onward(self):
+        """Lines before the uncaught-exception marker are noise and get discarded."""
+        hook = SparkSubmitHook(conn_id="spark_standalone_cluster")
+        log_lines = [
+            "WARNING: Using incubator modules: jdk.incubator.vector",
+            "26/07/27 09:43:44 INFO SparkKubernetesClientFactory: Auto-configuring K8S client",
+            'Exception in thread "main" io.fabric8.kubernetes.client.KubernetesClientException: boom',
+            "\tat io.fabric8.kubernetes.client.dsl.internal.OperationSupport.handleCreate(OS.java:340)",
+        ]
+
+        hook._process_spark_submit_log(log_lines)
+
+        assert list(hook._last_submit_log_lines) == [line.strip() for line in log_lines[2:]]
+
+    def test_process_spark_submit_log_without_exception_marker_uses_rolling_tail(self):
+        """No 'Exception in thread' anywhere -> falls back to the plain last-20 tail."""
+        hook = SparkSubmitHook(conn_id="spark_standalone_cluster")
+        log_lines = [f"plain output line {i}" for i in range(25)]
+
+        hook._process_spark_submit_log(log_lines)
+
+        assert list(hook._last_submit_log_lines) == log_lines[-20:]
+
+    def test_process_spark_submit_log_exception_message_survives_long_stack_trace(self):
+        """A message preceding 30+ stack frames must not roll off the buffer."""
+        hook = SparkSubmitHook(conn_id="spark_standalone_cluster")
+        message_line = (
+            'Exception in thread "main" io.fabric8.kubernetes.client.KubernetesClientException: '
+            'pods "arrow-spark-driver" is forbidden: exceeded quota: spark-demo-quota'
+        )
+        log_lines = [message_line] + [f"\tat some.deep.Frame.method{i}(Frame.java:{i})" for i in range(30)]
+
+        hook._process_spark_submit_log(log_lines)
+
+        assert next(iter(hook._last_submit_log_lines)) == message_line
+        assert "exceeded quota" in hook._submit_log_tail
+
+    def test_process_spark_submit_log_anchor_buffer_truncates_at_500(self):
+        """The widened post-anchor buffer still enforces its own maxlen."""
+        hook = SparkSubmitHook(conn_id="spark_standalone_cluster")
+        marker_line = 'Exception in thread "main" java.lang.RuntimeException: boom'
+        log_lines = [marker_line] + [f"line {i}" for i in range(505)]
+
+        hook._process_spark_submit_log(log_lines)
+
+        assert len(hook._last_submit_log_lines) == 500
+        assert list(hook._last_submit_log_lines) == [f"line {i}" for i in range(5, 505)]
+
     def test_process_spark_driver_status_log(self):
         # Given
         hook = SparkSubmitHook(conn_id="spark_standalone_cluster")
@@ -1227,6 +1303,75 @@ class TestSparkSubmitHook:
                 ("spark-submit",),
                 "spark-submit",
             ),
+            (
+                ("spark-submit", "foo", "--secret", "topsecret", "--bar"),
+                "spark-submit foo --secret ****** --bar",
+            ),
+            (
+                ("spark-submit", "--conf", "spark.mySecret=abc"),
+                "spark-submit --conf spark.mySecret=******",
+            ),
+            (
+                ("spark-submit", "--PASSWORD=abc"),
+                "spark-submit --PASSWORD=******",
+            ),
+            (
+                ("spark-submit", "--conf", "HivePassword='multi word pass'", "--after"),
+                "spark-submit --conf HivePassword='******' --after",
+            ),
+            (
+                ("spark-submit", "--password", "'multi word pass'", "--bar", "baz"),
+                "spark-submit --password '******' --bar baz",
+            ),
+            (
+                ("spark-submit", "--password"),
+                "spark-submit --password",
+            ),
+            (
+                ("spark-submit", "--password", "", "hunter2"),
+                "spark-submit --password  ******",
+            ),
+            (
+                ("Using  password  hunter2",),
+                "Using  password  ******",
+            ),
+            (
+                ("spark-submit --password\thunter2",),
+                "spark-submit --password\t******",
+            ),
+            (
+                ("spark-submit\t--conf\tHivePassword='abc'",),
+                "spark-submit\t--conf\tHivePassword='******'",
+            ),
+            # Multiple sensitive keys inside a single token (reviewer-identified blind spot):
+            # the old anchored regex missed the second key after a closed quote.
+            (
+                ['Config(secret="x",password=hunter2)'],
+                'Config(secret="******",password=******',
+            ),
+            (
+                ["--conf", "spark.a.secret='x',spark.b.password=hunter2"],
+                "--conf spark.a.secret='******',spark.b.password=******",
+            ),
+            # Quoted multi-word values whose closing quote is followed by punctuation,
+            # as in Python-repr or dict-shaped log output.
+            (
+                ['Config(password="my pass word", user=x)'],
+                'Config(password="******", user=x)',
+            ),
+            (
+                ["{'password': 'a b'}"],
+                "{'password': '******'}",
+            ),
+            # A quote followed by punctuation inside the value must not close it early.
+            (
+                ["spark-submit", "--password='Pa'$$w0rd'", "--next"],
+                "spark-submit --password='******' --next",
+            ),
+            (
+                "spark-submit --password=hunter2",
+                "spark-submit --password=******",
+            ),
         ],
     )
     @pytest.mark.db_test
@@ -1239,6 +1384,74 @@ class TestSparkSubmitHook:
 
         # Then
         assert command_masked == expected
+
+    @pytest.mark.db_test
+    def test_masks_passwords_stays_fast_on_large_input(self) -> None:
+        # The previous pattern retried at every offset on long inputs, taking tens of
+        # seconds for this payload and blocking the worker slot. The trailing space is
+        # deliberate: it makes 25,000 separate tokens, which is what exercises the
+        # per-offset retry rather than a single very long token.
+        hook = SparkSubmitHook()
+        payload = ["spark-submit", "--arg", "x " * 25_000]
+
+        start = time.monotonic()
+        command_masked = hook._mask_cmd(payload)
+        elapsed = time.monotonic() - start
+
+        assert command_masked == " ".join(payload)
+        assert elapsed < 5
+
+    @pytest.mark.db_test
+    def test_masks_passwords_does_not_swallow_following_lines(self) -> None:
+        # An unterminated quote must not consume the log lines after it: the value
+        # ends at the newline, so the rest of the captured output survives masking.
+        hook = SparkSubmitHook()
+        command = 'spark-submit --conf password="abc\nERROR: job failed\n--other=1 "tail'
+
+        command_masked = hook._mask_cmd([command])
+
+        assert command_masked == 'spark-submit --conf password=******\nERROR: job failed\n--other=1 "tail'
+
+    @pytest.mark.db_test
+    @pytest.mark.parametrize(
+        "token",
+        [
+            pytest.param("secret" * 20_000, id="repeated-keywords"),
+            pytest.param("a=" + "secret" * 20_000, id="equals-before-repeated-keywords"),
+            pytest.param("password='x'," * 20_000, id="repeated-closed-quoted-values"),
+        ],
+    )
+    def test_masks_passwords_stays_fast_on_repeated_keywords(self, token: str) -> None:
+        # A token packing many sensitive keywords made the previous pattern backtrack
+        # quadratically or worse; the scan must stay linear on these shapes.
+        hook = SparkSubmitHook()
+        payload = ["spark-submit", "--arg", token]
+
+        start = time.monotonic()
+        hook._mask_cmd(payload)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5
+
+    @pytest.mark.db_test
+    def test_submit_log_tail_empty_when_no_lines_captured(self) -> None:
+        hook = SparkSubmitHook()
+
+        assert hook._submit_log_tail == ""
+
+    @pytest.mark.db_test
+    def test_submit_log_tail_formats_and_masks_captured_lines(self) -> None:
+        hook = SparkSubmitHook()
+        hook._last_submit_log_lines.append("Exception in thread main: SparkException: bad jar")
+        hook._last_submit_log_lines.append("--password='secret'")
+
+        tail = hook._submit_log_tail
+
+        assert tail == (
+            "\nLast spark-submit output:\n"
+            "Exception in thread main: SparkException: bad jar\n"
+            "--password='******'"
+        )
 
     @pytest.mark.db_test
     def test_create_keytab_path_from_base64_keytab_with_decode_exception(self):
@@ -1536,7 +1749,7 @@ class TestSparkSubmitHook:
         succeeded_pod = V1Pod(status=V1PodStatus(phase="Succeeded"))
         mock_client.read_namespaced_pod.side_effect = [running_pod, succeeded_pod]
 
-        with patch.object(hook, "_run_post_submit_commands"):
+        with patch.object(hook, "_run_post_submit_commands"), patch("time.sleep"):
             hook._poll_k8s_driver_via_api()
 
         assert mock_client.delete_namespaced_pod.call_args.args[:2] == ("spark-app-abc-driver", "mynamespace")
@@ -1666,10 +1879,15 @@ class TestSparkSubmitHook:
         return f"{cls._RM_BASE_URL}/ws/v1/cluster/apps/{app_id or cls._RM_APP_ID}/state"
 
     @classmethod
-    def _rm_status_resp(cls, final_status: str, state: str = "FINISHED") -> MagicMock:
+    def _rm_status_resp(
+        cls, final_status: str, state: str = "FINISHED", diagnostics: str | None = None
+    ) -> MagicMock:
         resp = MagicMock(spec=requests.Response)
         resp.status_code = 200
-        resp.json.return_value = {"app": {"id": cls._RM_APP_ID, "state": state, "finalStatus": final_status}}
+        app = {"id": cls._RM_APP_ID, "state": state, "finalStatus": final_status}
+        if diagnostics is not None:
+            app["diagnostics"] = diagnostics
+        resp.json.return_value = {"app": app}
         return resp
 
     @staticmethod
@@ -1775,6 +1993,44 @@ class TestSparkSubmitHook:
 
     @patch("airflow.providers.apache.spark.hooks.spark_submit.time.sleep")
     @patch("airflow.providers.apache.spark.hooks.spark_submit.requests.get")
+    def test_yarn_status_tracking_includes_diagnostics_on_state_failure(self, mock_get, mock_sleep):
+        """RM state FAILED/KILLED -> raised message includes the RM's diagnostics field."""
+        mock_get.return_value = self._rm_status_resp(
+            "KILLED",
+            state="KILLED",
+            diagnostics="Application application_1700000000000_0001 was killed by user root",
+        )
+
+        hook = SparkSubmitHook(conn_id="spark_yarn_rm", yarn_track_via_rm_api=True)
+        with pytest.raises(RuntimeError, match="Diagnostics: Application .* was killed by user root"):
+            hook._start_yarn_application_status_tracking(self._RM_APP_ID)
+
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.time.sleep")
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.requests.get")
+    def test_yarn_status_tracking_includes_diagnostics_on_final_status_failure(self, mock_get, mock_sleep):
+        """RM finalStatus FAILED (state FINISHED) -> raised message includes diagnostics."""
+        mock_get.return_value = self._rm_status_resp(
+            "FAILED", diagnostics="AM Container exited with exitCode: 1"
+        )
+
+        hook = SparkSubmitHook(conn_id="spark_yarn_rm", yarn_track_via_rm_api=True)
+        with pytest.raises(RuntimeError, match="Diagnostics: AM Container exited with exitCode: 1"):
+            hook._start_yarn_application_status_tracking(self._RM_APP_ID)
+
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.time.sleep")
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.requests.get")
+    def test_yarn_status_tracking_omits_diagnostics_suffix_when_absent(self, mock_get, mock_sleep):
+        """RM response with no diagnostics field -> message has no 'Diagnostics:' suffix."""
+        mock_get.return_value = self._rm_status_resp("KILLED")
+
+        hook = SparkSubmitHook(conn_id="spark_yarn_rm", yarn_track_via_rm_api=True)
+        with pytest.raises(RuntimeError) as exc_info:
+            hook._start_yarn_application_status_tracking(self._RM_APP_ID)
+
+        assert "Diagnostics:" not in str(exc_info.value)
+
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.time.sleep")
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.requests.get")
     def test_yarn_status_tracking_fails_on_unexpected_final_status(self, mock_get, mock_sleep):
         """RM returns a non-standard finalStatus ('BOGUS') -> raise without sleeping."""
         mock_get.return_value = self._rm_status_resp("BOGUS")
@@ -1784,6 +2040,16 @@ class TestSparkSubmitHook:
             hook._start_yarn_application_status_tracking(self._RM_APP_ID)
 
         mock_sleep.assert_not_called()
+
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.time.sleep")
+    @patch("airflow.providers.apache.spark.hooks.spark_submit.requests.get")
+    def test_yarn_status_tracking_includes_diagnostics_on_unexpected_final_status(self, mock_get, mock_sleep):
+        """RM returns a non-standard finalStatus -> raised message also includes diagnostics."""
+        mock_get.return_value = self._rm_status_resp("ENDED", diagnostics="Application state is ENDED")
+
+        hook = SparkSubmitHook(conn_id="spark_yarn_rm", yarn_track_via_rm_api=True)
+        with pytest.raises(RuntimeError, match="unexpected final status: ENDED\nDiagnostics: .*ENDED"):
+            hook._start_yarn_application_status_tracking(self._RM_APP_ID)
 
     @patch("airflow.providers.apache.spark.hooks.spark_submit.subprocess.Popen")
     def test_yarn_submit_captures_app_id_without_submitted_application_log(self, mock_popen):

@@ -17,11 +17,10 @@
 from __future__ import annotations
 
 import contextlib
-import json
-import time
 from datetime import datetime
 
 import boto3
+from botocore.config import Config
 
 from airflow.providers.amazon.aws.hooks.neptune_analytics import NeptuneAnalyticsHook
 from airflow.providers.amazon.aws.operators.neptune_analytics import (
@@ -50,7 +49,15 @@ from system.amazon.aws.utils import SystemTestContextBuilder
 
 DAG_ID = "example_neptune_analytics"
 
-sys_test_context_task = SystemTestContextBuilder().build()
+NEPTUNE_IMPORT_ROLE_ARN_KEY = "NEPTUNE_IMPORT_ROLE_ARN"
+
+# neptune-graph uses account-id-based endpoints. The botocore version pinned by the
+# aiobotocore extra (installed for deferrable mode) mis-signs those endpoints, so AWS
+# rejects the request with "Unable to determine service/operation name to be authorized".
+# Forcing the standard regional endpoint keeps the test working across botocore versions.
+NEPTUNE_BOTOCORE_CONFIG = {"account_id_endpoint_mode": "disabled"}
+
+sys_test_context_task = SystemTestContextBuilder().add_variable(NEPTUNE_IMPORT_ROLE_ARN_KEY).build()
 
 # Minimal OpenCypher CSV data for import testing.
 NODES_CSV = """~id,~label,name:String
@@ -62,63 +69,11 @@ EDGES_CSV = """~id,~from,~to,~label
 e1,n1,n2,KNOWS
 """
 
-NEPTUNE_ANALYTICS_TRUST_POLICY = json.dumps(
-    {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"Service": "neptune-graph.amazonaws.com"},
-                "Action": "sts:AssumeRole",
-            }
-        ],
-    }
-)
-
-S3_READ_POLICY_DOCUMENT = json.dumps(
-    {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["s3:GetObject", "s3:ListBucket"],
-                "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"],
-            }
-        ],
-    }
-)
-
-
-@task
-def create_neptune_import_role(role_name: str) -> str:
-    iam_client = boto3.client("iam")
-    iam_client.create_role(
-        RoleName=role_name,
-        AssumeRolePolicyDocument=NEPTUNE_ANALYTICS_TRUST_POLICY,
-        Description="Role for Neptune Analytics import system test",
-    )
-    iam_client.put_role_policy(
-        RoleName=role_name,
-        PolicyName="NeptuneAnalyticsS3Access",
-        PolicyDocument=S3_READ_POLICY_DOCUMENT,
-    )
-    role = iam_client.get_role(RoleName=role_name)
-    time.sleep(60)  # Wait for IAM eventual consistency (role + inline policy propagation)
-    return role["Role"]["Arn"]
-
 
 @task(trigger_rule=TriggerRule.ALL_DONE)
-def delete_neptune_import_role(role_name: str) -> None:
-    iam_client = boto3.client("iam")
-    with contextlib.suppress(iam_client.exceptions.NoSuchEntityException):
-        iam_client.delete_role_policy(RoleName=role_name, PolicyName="NeptuneAnalyticsS3Access")
-        iam_client.delete_role(RoleName=role_name)
-
-
-@task(trigger_rule=TriggerRule.ALL_DONE)
-def delete_graph_if_exists(graph_name: str) -> None:
+def delete_graph_if_exists(graph_name: str, region_name: str | None = None) -> None:
     """Safety net to clean up the graph in case a previous task failed."""
-    hook = NeptuneAnalyticsHook()
+    hook = NeptuneAnalyticsHook(region_name=region_name, config=Config(**NEPTUNE_BOTOCORE_CONFIG))
     with contextlib.suppress(Exception):
         # List graphs and find by name
         paginator = hook.conn.get_paginator("list_graphs")
@@ -162,7 +117,9 @@ with DAG(
     graph_name = f"{env_id}-graph"
     import_graph_name = f"{env_id}-import-graph"
     bucket_name = f"{env_id}-neptune-analytics"
-    import_role_name = f"{env_id}-neptune-import"
+    import_role_arn = test_context[NEPTUNE_IMPORT_ROLE_ARN_KEY]
+    # neptune-graph must be pinned to an explicit region: with account_id_endpoint_mode disabled
+    # botocore builds the standard regional endpoint, which it cannot resolve when region is None.
     region = boto3.session.Session().region_name
 
     # --- TEST SETUP ---
@@ -188,8 +145,6 @@ with DAG(
         replace=True,
     )
 
-    create_role = create_neptune_import_role(import_role_name)
-
     # --- TEST BODY ---
 
     # [START howto_operator_neptune_analytics_create_graph]
@@ -205,6 +160,8 @@ with DAG(
         deferrable=False,
         waiter_delay=30,
         waiter_max_attempts=60,
+        region_name=region,
+        botocore_config=NEPTUNE_BOTOCORE_CONFIG,
     )
     # [END howto_operator_neptune_analytics_create_graph]
 
@@ -213,6 +170,8 @@ with DAG(
         task_id="create_endpoint",
         graph_identifier="{{ ti.xcom_pull(task_ids='create_graph')['graph_id']}}",
         wait_for_completion=True,
+        region_name=region,
+        botocore_config=NEPTUNE_BOTOCORE_CONFIG,
     )
     # [END howto_operator_neptune_analytics_create_private_endpoint]
 
@@ -225,6 +184,8 @@ with DAG(
         deferrable=False,
         waiter_delay=30,
         waiter_max_attempts=60,
+        region_name=region,
+        botocore_config=NEPTUNE_BOTOCORE_CONFIG,
     )
     # [END howto_operator_neptune_analytics_delete_private_endpoint]
 
@@ -232,7 +193,7 @@ with DAG(
     start_import = NeptuneStartImportTaskOperator(
         task_id="start_import",
         graph_identifier="{{ ti.xcom_pull(task_ids='create_graph')['graph_id'] }}",
-        role_arn=create_role,
+        role_arn=import_role_arn,
         source=f"s3://{bucket_name}/data/",
         format="CSV",
         fail_on_error=True,
@@ -240,6 +201,8 @@ with DAG(
         deferrable=False,
         waiter_delay=30,
         waiter_max_attempts=60,
+        region_name=region,
+        botocore_config=NEPTUNE_BOTOCORE_CONFIG,
     )
     # [END howto_operator_neptune_analytics_start_import_task]
 
@@ -249,6 +212,8 @@ with DAG(
         import_task_id="{{ ti.xcom_pull(task_ids='start_import')['import_task_id']}}",
         wait_for_completion=True,
         aws_conn_id="aws_default",
+        region_name=region,
+        botocore_config=NEPTUNE_BOTOCORE_CONFIG,
     )
     # [END howto_operator_neptune_analytics_cancel_import_task]
 
@@ -261,6 +226,8 @@ with DAG(
         deferrable=False,
         waiter_delay=30,
         waiter_max_attempts=60,
+        region_name=region,
+        botocore_config=NEPTUNE_BOTOCORE_CONFIG,
     )
     # [END howto_operator_neptune_analytics_delete_graph]
 
@@ -270,7 +237,7 @@ with DAG(
         graph_name=import_graph_name,
         vector_search_config={"dimension": 128},
         source=f"s3://{bucket_name}/data/",
-        role_arn=create_role,
+        role_arn=import_role_arn,
         format="CSV",
         fail_on_error=True,
         public_connectivity=True,
@@ -282,6 +249,8 @@ with DAG(
         deferrable=False,
         waiter_delay=30,
         waiter_max_attempts=60,
+        region_name=region,
+        botocore_config=NEPTUNE_BOTOCORE_CONFIG,
     )
     # [END howto_operator_neptune_analytics_create_graph_with_import]
 
@@ -295,6 +264,8 @@ with DAG(
         trigger_rule=TriggerRule.ALL_DONE,
         waiter_delay=30,
         waiter_max_attempts=60,
+        region_name=region,
+        botocore_config=NEPTUNE_BOTOCORE_CONFIG,
     )
     # [END howto_operator_neptune_analytics_delete_import_graph]
 
@@ -307,17 +278,16 @@ with DAG(
         force_delete=True,
     )
 
-    delete_role = delete_neptune_import_role(import_role_name)
-
-    cleanup_graph = delete_graph_if_exists.override(task_id="cleanup_graph")(graph_name)
-    cleanup_import_graph = delete_graph_if_exists.override(task_id="cleanup_import_graph")(import_graph_name)
+    cleanup_graph = delete_graph_if_exists.override(task_id="cleanup_graph")(graph_name, region)
+    cleanup_import_graph = delete_graph_if_exists.override(task_id="cleanup_import_graph")(
+        import_graph_name, region
+    )
 
     chain(
         # TEST SETUP
         test_context,
         create_bucket,
         [upload_nodes, upload_edges],
-        create_role,
         # TEST BODY: Create graph, import data, then delete
         create_graph,
         create_endpoint,
@@ -331,7 +301,6 @@ with DAG(
         # TEST TEARDOWN
         [cleanup_graph, cleanup_import_graph],
         delete_bucket,
-        delete_role,
     )
 
     from tests_common.test_utils.watcher import watcher

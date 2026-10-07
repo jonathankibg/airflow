@@ -9,8 +9,7 @@
   "config": {
     "columns": {
       "section": "القسم"
-    },
-    "title": "Airflow إعدادات"
+    }
   },
   "connections": {
     "add": "إضافة موَّصل",
@@ -46,7 +45,6 @@
       "connectionIdRequired": "مطلوب معرِّف الموَّصل",
       "connectionIdRequirement": "لا يمكن أن يحتوي معرِّف الموَّصل على مسافات فقط",
       "connectionTypeRequired": "مطلوب نوع الموَّصل",
-      "extraFields": "حقول إضافية",
       "extraFieldsJson": "JSON حقول إضافية بصيغة",
       "helperText": "نوع الموَّصل مفقود؟ تأكد من تثبيت حزمة Airflow المناسبة.",
       "helperTextForRedactedFields": "لن تتغير الحقول المحجوبة ('***') إذا لم يتم تعديلها.",
@@ -205,6 +203,7 @@
           "title": "تخطي"
         }
       },
+      "parsingFile": "جارٍ تحليل الملف...",
       "title": "استيراد المتغيرات",
       "upload": "تحميل ملف JSON",
       "uploadPlaceholder": "حمل ملف JSON يحتوي علي متغيرات (مثال: {\"key\": \"value\", ...})"

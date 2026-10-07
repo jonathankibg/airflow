@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests_common.test_utils.version_compat import AIRFLOW_V_3_1_PLUS
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_1_PLUS, AIRFLOW_V_3_4_PLUS
 
 if not AIRFLOW_V_3_1_PLUS:
     pytest.skip("Human in the loop is only compatible with Airflow >= 3.1.0", allow_module_level=True)
@@ -29,6 +29,7 @@ from unittest import mock
 
 import time_machine
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from airflow.api_fastapi.app import create_app, purge_cached_app
 from airflow.api_fastapi.auth.managers.simple.user import SimpleAuthManagerUser
@@ -51,8 +52,8 @@ from airflow.providers.common.ai.utils.hitl_review import (
     AgentSessionData,
     SessionStatus,
 )
+from airflow.providers.common.compat.sdk import timezone
 from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.utils import timezone
 from airflow.utils.session import provide_session
 from airflow.utils.types import DagRunType
 
@@ -107,23 +108,23 @@ def _create_hitl_session(
         prompt=prompt,
         current_output=current_output,
     )
-    XComModel.set(
+    _write_xcom(
+        session,
         key=XCOM_AGENT_SESSION,
         value=sess.model_dump(mode="json"),
         dag_id=dag_id,
         task_id=task_id,
         run_id=run_id,
         map_index=map_index,
-        session=session,
     )
-    XComModel.set(
+    _write_xcom(
+        session,
         key=f"{XCOM_AGENT_OUTPUT_PREFIX}{iteration}",
         value=current_output,
         dag_id=dag_id,
         task_id=task_id,
         run_id=run_id,
         map_index=map_index,
-        session=session,
     )
 
 
@@ -311,14 +312,14 @@ class TestReadXcomByPrefix:
         dag_maker.sync_dagbag_to_db()
 
         for suffix, val in xcom_entries:
-            XComModel.set(
+            _write_xcom(
+                session,
                 key=f"{prefix}{suffix}",
                 value=val,
                 dag_id="d",
                 task_id="t",
                 run_id="r",
                 map_index=-1,
-                session=session,
             )
         session.commit()
 
@@ -383,16 +384,36 @@ class TestReadXcomByPrefix:
         dag_maker.create_dagrun(run_id="r", run_type=DagRunType.MANUAL, logical_date=logical_date)
         dag_maker.sync_dagbag_to_db()
 
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_AGENT_OUTPUT_PREFIX}1",
             value=output_value,
             dag_id="d",
             task_id="t",
             run_id="r",
             map_index=-1,
-            session=session,
         )
         session.commit()
+
+        if AIRFLOW_V_3_4_PLUS:
+            read = XComModel.get_many(
+                run_id="r",
+                dag_ids="d",
+                task_ids="t",
+                key=f"{XCOM_AGENT_OUTPUT_PREFIX}1",
+            )
+            entity = read.column_descriptions[0]["entity"]
+            stored = session.scalar(read.with_only_columns(entity.value))
+        else:
+            stored = session.scalar(
+                select(XComModel.value).where(
+                    XComModel.dag_id == "d",
+                    XComModel.task_id == "t",
+                    XComModel.run_id == "r",
+                    XComModel.key == f"{XCOM_AGENT_OUTPUT_PREFIX}1",
+                )
+            )
+        assert stored == output_value
 
         result = _read_xcom_by_prefix(
             session,
@@ -420,14 +441,14 @@ class TestReadXcomByPrefix:
             (4, "Final summary text."),
         ]
         for i, val in entries:
-            XComModel.set(
+            _write_xcom(
+                session,
                 key=f"{XCOM_AGENT_OUTPUT_PREFIX}{i}",
                 value=val,
                 dag_id="d",
                 task_id="t",
                 run_id="r",
                 map_index=-1,
-                session=session,
             )
         session.commit()
 
@@ -508,14 +529,14 @@ class TestReadXcom:
         dag_maker.sync_dagbag_to_db()
 
         if value is not None:
-            XComModel.set(
+            _write_xcom(
+                session,
                 key=key,
                 value=value,
                 dag_id="d",
                 task_id="t",
                 run_id="r",
                 map_index=-1,
-                session=session,
             )
         session.commit()
 
@@ -603,6 +624,28 @@ class TestWriteXcom:
         assert result == expected
         _clear_db()
 
+    @pytest.mark.skipif(not AIRFLOW_V_3_4_PLUS, reason="Attempt ownership starts in Airflow 3.4")
+    def test_write_uses_current_attempt_after_retry(self, session, dag_maker):
+        from airflow.models.xcom import XComModelV2
+        from airflow.utils.state import TaskInstanceState
+
+        _clear_db()
+        with dag_maker("d", schedule=None, start_date=logical_date, serialized=True):
+            EmptyOperator(task_id="t")
+        run = dag_maker.create_dagrun(run_id="r", run_type=DagRunType.MANUAL, logical_date=logical_date)
+        dag_maker.sync_dagbag_to_db()
+        old = run.get_task_instance("t", session=session)
+        old.state = TaskInstanceState.RUNNING
+        _write_xcom(session, dag_id="d", run_id="r", task_id="t", key="owner", value="old")
+
+        current = old.prepare_db_for_next_try(session)
+        _write_xcom(session, dag_id="d", run_id="r", task_id="t", key="owner", value="current")
+
+        assert XComModelV2.get_for_attempt(old.id, "owner", session=session).value == "old"
+        assert XComModelV2.get_for_attempt(current.id, "owner", session=session).value == "current"
+        assert _read_xcom(session, dag_id="d", run_id="r", task_id="t", key="owner") == "current"
+        _clear_db()
+
 
 class TestGetBaseUrlPath:
     def test_default_base_url(self):
@@ -641,6 +684,29 @@ class TestIsTaskCompleted:
 
         result = _is_task_completed(session, dag_id="d", run_id="r", task_id="t", map_index=-1)
         assert result is False
+
+    @pytest.mark.skipif(not AIRFLOW_V_3_4_PLUS, reason="Attempt ownership starts in Airflow 3.4")
+    @pytest.mark.parametrize(
+        ("old_state", "archived_state"),
+        [
+            pytest.param("success", "success", id="archived-success"),
+            pytest.param("running", "failed", id="archived-failed-retry"),
+        ],
+    )
+    def test_ignores_historical_attempt_state(self, session, dag_maker, old_state, archived_state):
+        from airflow.utils.state import TaskInstanceState
+
+        with dag_maker("d", schedule=None, start_date=logical_date, serialized=True):
+            EmptyOperator(task_id="t")
+        run = dag_maker.create_dagrun(run_id="r", run_type=DagRunType.MANUAL, logical_date=logical_date)
+        old = run.get_task_instance("t", session=session)
+        old.state = TaskInstanceState(old_state)
+        current = old.prepare_db_for_next_try(session)
+        assert old.state == TaskInstanceState(archived_state)
+        current.state = TaskInstanceState.RUNNING
+        session.flush()
+
+        assert _is_task_completed(session, dag_id="d", run_id="r", task_id="t") is False
 
 
 class TestBuildSessionResponse:
@@ -791,14 +857,14 @@ class TestBuildSessionResponse:
             current_output="Initial",
             session=session,
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_HUMAN_FEEDBACK_PREFIX}1",
             value="Please add more detail",
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
         session.commit()
 
@@ -832,50 +898,50 @@ class TestBuildSessionResponse:
             prompt="p",
             current_output="Output 2",
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=XCOM_AGENT_SESSION,
             value=sess.model_dump(mode="json"),
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_AGENT_OUTPUT_PREFIX}1",
             value="Output 1",
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_AGENT_OUTPUT_PREFIX}2",
             value="Output 2",
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_HUMAN_FEEDBACK_PREFIX}1",
             value="Feedback 1",
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_HUMAN_FEEDBACK_PREFIX}2",
             value="Feedback 2",
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
         session.commit()
 
@@ -1042,41 +1108,41 @@ class TestFindSessionEndpoint:
             prompt="Summarize",
             current_output="Revised output",
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=XCOM_AGENT_SESSION,
             value=sess.model_dump(mode="json"),
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_AGENT_OUTPUT_PREFIX}1",
             value="First output",
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_AGENT_OUTPUT_PREFIX}2",
             value="Revised output",
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
-        XComModel.set(
+        _write_xcom(
+            session,
             key=f"{XCOM_HUMAN_FEEDBACK_PREFIX}1",
             value="Add more detail",
             dag_id=TEST_DAG_ID,
             task_id=TEST_TASK_ID,
             run_id=TEST_RUN_ID,
             map_index=-1,
-            session=session,
         )
         session.commit()
 
